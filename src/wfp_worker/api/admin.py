@@ -1,20 +1,38 @@
 """
 관리자 라우터 (ADMIN 권한 필요).
 
-엔드포인트:
-  GET   /admin/users                사용자 목록
-  PATCH /admin/users/{id}           권한 변경 / 활성화 토글
-  GET   /admin/jobs                 전체 잡 목록
-  GET   /admin/resources            GPU/디스크/큐 현황
-  GET   /admin/catalog/models       카탈로그 전체 (관리)
-  POST  /admin/catalog/models       카탈로그 추가
-  PATCH /admin/catalog/models/{id}  카탈로그 수정
-  DELETE /admin/catalog/models/{id} 카탈로그 비활성
-  GET   /admin/audit                감사 로그
+엔드포인트 (PRD §10):
+  10.1 대시보드
+    GET   /admin/stats                통계 카드 (사용자/잡/리소스/타이밍)
+    GET   /admin/resources            GPU/디스크/큐 현황
+
+  10.2 작업 모니터링
+    GET   /admin/jobs                 전체 잡 목록 (필터 지원)
+    GET   /admin/jobs/{id}            잡 상세 + 이벤트 로그
+    POST  /admin/jobs/{id}/cancel     강제 취소
+    PATCH /admin/jobs/{id}/priority   우선순위 변경
+
+  10.3 자원 회수
+    POST  /admin/reaper/run           Reaper 수동 트리거
+
+  10.4 카탈로그 관리
+    GET/POST/PATCH/DELETE /admin/catalog/models      모델 카탈로그 CRUD
+    GET/POST/PATCH/DELETE /admin/data-sources        데이터 소스 화이트리스트 CRUD
+    GET/POST/PATCH/DELETE /admin/presets             카테고리/프리셋 CRUD
+
+  10.5 감사 로그
+    GET   /admin/audit                감사 로그 (필터 지원)
+
+  부가
+    GET   /admin/users                사용자 목록
+    PATCH /admin/users/{id}           권한/활성화 토글
+    GET   /admin/env/status           환경 진단
+    POST  /admin/env/install          학습 패키지 자동 설치
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -22,7 +40,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from wfp_worker.auth import get_current_admin
-from wfp_worker.db import AuditLog, ModelCatalogEntry, User, UserRole, get_db
+from wfp_worker.db import (
+    AuditLog,
+    CategoryPreset,
+    DataSourceWhitelist,
+    ModelCatalogEntry,
+    User,
+    UserRole,
+    get_db,
+)
 from wfp_worker.runtime import _jobs
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -203,8 +229,38 @@ def force_cancel_job(
     if spec.state in (JobState.DONE, JobState.FAILED, JobState.CANCELLED):
         raise HTTPException(status_code=409, detail=f"Job already {spec.state.value}")
     spec.state = JobState.CANCELLED
+    spec.finished_at = datetime.now(timezone.utc)
     _audit(db, actor, "job_cancel", target=job_id, detail=f"user_id={spec.user_id}")
     return {"job_id": job_id, "state": "CANCELLED"}
+
+
+class PriorityUpdate(BaseModel):
+    priority: int = Field(ge=1, le=9, description="1=가장 높음, 9=가장 낮음. 기본 5")
+
+
+@router.patch("/jobs/{job_id}/priority", response_model=AdminJobItem)
+def update_job_priority(
+    job_id: str,
+    body: PriorityUpdate,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> AdminJobItem:
+    """잡 우선순위 변경 (PRD §10.2). PENDING 상태에서만 의미가 있음."""
+    spec = _jobs.get(job_id)
+    if not spec:
+        raise HTTPException(status_code=404, detail="Job not found")
+    old = spec.priority
+    spec.priority = body.priority
+    _audit(
+        db, actor, "job_priority",
+        target=job_id, detail=f"{old} -> {body.priority}",
+    )
+    return AdminJobItem(
+        job_id=str(spec.job_id), user_id=spec.user_id,
+        state=spec.state.value, current_stage=spec.current_stage,
+        ksic_section=spec.ksic_section, model_hf_repo=spec.model_hf_repo,
+        created_at=spec.created_at.isoformat() if spec.created_at else None,
+    )
 
 
 # ─────────────────────────────────────────
@@ -365,7 +421,17 @@ def delete_catalog(
 # ─────────────────────────────────────────
 
 
+class GpuBreakdown(BaseModel):
+    index: int
+    name: str
+    vram_used_mb: float = 0.0
+    vram_total_mb: float = 0.0
+    util_pct: float = 0.0
+
+
 class StatsResponse(BaseModel):
+    """PRD §10.1 대시보드 카드."""
+
     users_total: int
     users_active: int
     jobs_pending: int
@@ -373,8 +439,12 @@ class StatsResponse(BaseModel):
     jobs_done: int
     jobs_failed: int
     jobs_cancelled: int
+    queue_depth: int                   # PENDING 잡 개수 = 큐 길이
+    avg_wait_seconds: float | None = None    # PENDING → RUNNING 평균
+    avg_train_seconds: float | None = None   # RUNNING → DONE 평균
     disk_free_gb: float
     gpu_count: int
+    gpu_breakdown: list[GpuBreakdown] = []
 
 
 @router.get("/stats", response_model=StatsResponse)
@@ -389,6 +459,9 @@ def get_stats(
     users_active = db.query(User).filter(User.is_active.is_(True)).count()
 
     pending = running = done = failed = cancelled = 0
+    wait_durations: list[float] = []
+    train_durations: list[float] = []
+
     for spec in _jobs.values():
         s = spec.state
         if s == JobState.PENDING:
@@ -402,12 +475,34 @@ def get_stats(
         elif s == JobState.CANCELLED:
             cancelled += 1
 
+        # 타이밍 누적 (started_at/finished_at 모두 존재하는 잡만)
+        if spec.started_at and spec.created_at:
+            wait_durations.append((spec.started_at - spec.created_at).total_seconds())
+        if spec.finished_at and spec.started_at and s == JobState.DONE:
+            train_durations.append((spec.finished_at - spec.started_at).total_seconds())
+
+    avg_wait = sum(wait_durations) / len(wait_durations) if wait_durations else None
+    avg_train = sum(train_durations) / len(train_durations) if train_durations else None
+
     caps = HWProber().probe()
+    gpu_breakdown = [
+        GpuBreakdown(
+            index=i, name=getattr(g, "name", f"GPU-{i}"),
+            vram_used_mb=getattr(g, "vram_used_mb", 0.0),
+            vram_total_mb=getattr(g, "vram_total_mb", 0.0),
+            util_pct=getattr(g, "util_pct", 0.0),
+        )
+        for i, g in enumerate(caps.gpus)
+    ]
+
     return StatsResponse(
         users_total=users_total, users_active=users_active,
         jobs_pending=pending, jobs_running=running,
         jobs_done=done, jobs_failed=failed, jobs_cancelled=cancelled,
+        queue_depth=pending,
+        avg_wait_seconds=avg_wait, avg_train_seconds=avg_train,
         disk_free_gb=caps.disk_free_gb, gpu_count=len(caps.gpus),
+        gpu_breakdown=gpu_breakdown,
     )
 
 
@@ -558,3 +653,220 @@ def run_reaper(
         disk_freed_mb=round(disk_freed, 2),
         detail=detail,
     )
+
+
+# ─────────────────────────────────────────
+# 데이터 소스 화이트리스트 (PRD §10.4)
+# ─────────────────────────────────────────
+
+
+class DataSourceItem(BaseModel):
+    id: str
+    name: str
+    source_type: str
+    url_pattern: str
+    description: str | None = None
+    is_active: bool
+
+
+class DataSourceCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    source_type: str = Field(pattern="^(hf_datasets|url|api|upload)$")
+    url_pattern: str = Field(min_length=1, max_length=512)
+    description: str | None = None
+
+
+class DataSourcePatch(BaseModel):
+    name: str | None = None
+    source_type: str | None = Field(default=None, pattern="^(hf_datasets|url|api|upload)$")
+    url_pattern: str | None = None
+    description: str | None = None
+    is_active: bool | None = None
+
+
+def _to_ds(d: DataSourceWhitelist) -> DataSourceItem:
+    return DataSourceItem(
+        id=d.id, name=d.name, source_type=d.source_type,
+        url_pattern=d.url_pattern, description=d.description,
+        is_active=d.is_active,
+    )
+
+
+@router.get("/data-sources", response_model=list[DataSourceItem])
+def list_data_sources(
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_admin),
+) -> list[DataSourceItem]:
+    q = db.query(DataSourceWhitelist)
+    if active_only:
+        q = q.filter(DataSourceWhitelist.is_active.is_(True))
+    return [_to_ds(d) for d in q.order_by(DataSourceWhitelist.created_at.desc()).all()]
+
+
+@router.post("/data-sources", response_model=DataSourceItem, status_code=status.HTTP_201_CREATED)
+def create_data_source(
+    body: DataSourceCreate,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> DataSourceItem:
+    if db.query(DataSourceWhitelist).filter_by(name=body.name).first():
+        raise HTTPException(status_code=409, detail="Name already exists")
+    entry = DataSourceWhitelist(**body.model_dump())
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    _audit(db, actor, "datasource_create", target=entry.id, detail=entry.name)
+    return _to_ds(entry)
+
+
+@router.patch("/data-sources/{entry_id}", response_model=DataSourceItem)
+def patch_data_source(
+    entry_id: str,
+    body: DataSourcePatch,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> DataSourceItem:
+    entry = db.get(DataSourceWhitelist, entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Not found")
+    for k, v in body.model_dump(exclude_unset=True).items():
+        setattr(entry, k, v)
+    db.commit()
+    db.refresh(entry)
+    _audit(db, actor, "datasource_patch", target=entry_id, detail=entry.name)
+    return _to_ds(entry)
+
+
+@router.delete("/data-sources/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_data_source(
+    entry_id: str,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> None:
+    entry = db.get(DataSourceWhitelist, entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Not found")
+    entry.is_active = False
+    db.commit()
+    _audit(db, actor, "datasource_delete", target=entry_id, detail=entry.name)
+
+
+# ─────────────────────────────────────────
+# 카테고리/프리셋 (PRD §10.4)
+# ─────────────────────────────────────────
+
+
+class PresetItem(BaseModel):
+    id: str
+    name: str
+    ksic_section: str
+    task_type: str
+    recommended_models: list[str]
+    default_config: dict
+    description: str | None = None
+    is_active: bool
+
+
+class PresetCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    ksic_section: str = Field(min_length=1, max_length=2)
+    task_type: str = Field(min_length=1, max_length=32)
+    recommended_models: list[str] = []
+    default_config: dict = {}
+    description: str | None = None
+
+
+class PresetPatch(BaseModel):
+    name: str | None = None
+    ksic_section: str | None = None
+    task_type: str | None = None
+    recommended_models: list[str] | None = None
+    default_config: dict | None = None
+    description: str | None = None
+    is_active: bool | None = None
+
+
+def _to_preset(p: CategoryPreset) -> PresetItem:
+    return PresetItem(
+        id=p.id, name=p.name, ksic_section=p.ksic_section, task_type=p.task_type,
+        recommended_models=[m for m in p.recommended_models.split(",") if m],
+        default_config=json.loads(p.default_config_json or "{}"),
+        description=p.description, is_active=p.is_active,
+    )
+
+
+@router.get("/presets", response_model=list[PresetItem])
+def list_presets(
+    ksic_section: str = "",
+    task_type: str = "",
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_admin),
+) -> list[PresetItem]:
+    q = db.query(CategoryPreset)
+    if ksic_section:
+        q = q.filter(CategoryPreset.ksic_section == ksic_section)
+    if task_type:
+        q = q.filter(CategoryPreset.task_type == task_type)
+    if active_only:
+        q = q.filter(CategoryPreset.is_active.is_(True))
+    return [_to_preset(p) for p in q.order_by(CategoryPreset.created_at.desc()).all()]
+
+
+@router.post("/presets", response_model=PresetItem, status_code=status.HTTP_201_CREATED)
+def create_preset(
+    body: PresetCreate,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> PresetItem:
+    if db.query(CategoryPreset).filter_by(name=body.name).first():
+        raise HTTPException(status_code=409, detail="Name already exists")
+    entry = CategoryPreset(
+        name=body.name, ksic_section=body.ksic_section, task_type=body.task_type,
+        recommended_models=",".join(body.recommended_models),
+        default_config_json=json.dumps(body.default_config),
+        description=body.description,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    _audit(db, actor, "preset_create", target=entry.id, detail=entry.name)
+    return _to_preset(entry)
+
+
+@router.patch("/presets/{entry_id}", response_model=PresetItem)
+def patch_preset(
+    entry_id: str,
+    body: PresetPatch,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> PresetItem:
+    entry = db.get(CategoryPreset, entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Not found")
+    data = body.model_dump(exclude_unset=True)
+    if "recommended_models" in data:
+        entry.recommended_models = ",".join(data.pop("recommended_models"))
+    if "default_config" in data:
+        entry.default_config_json = json.dumps(data.pop("default_config"))
+    for k, v in data.items():
+        setattr(entry, k, v)
+    db.commit()
+    db.refresh(entry)
+    _audit(db, actor, "preset_patch", target=entry_id, detail=entry.name)
+    return _to_preset(entry)
+
+
+@router.delete("/presets/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_preset(
+    entry_id: str,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> None:
+    entry = db.get(CategoryPreset, entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Not found")
+    entry.is_active = False
+    db.commit()
+    _audit(db, actor, "preset_delete", target=entry_id, detail=entry.name)

@@ -287,9 +287,14 @@ class JobSpec(BaseModel):
     error_code: str = ""
     error_message: str = ""
 
+    # 큐 우선순위 (낮을수록 먼저, PRD §10.2). 기본 5
+    priority: int = 5
+
     # 타임스탬프
     created_at: datetime = Field(default_factory=_utc_now)
     updated_at: datetime = Field(default_factory=_utc_now)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
 
     def update_stage(self, stage: int, state: JobState = JobState.RUNNING) -> None:
         """스테이지 전이 + 타임스탬프 갱신."""

@@ -397,14 +397,39 @@ for a in artifacts:
 
 ## 5. API 엔드포인트
 
+### 공통 / 사용자
+
 | 메서드   | 경로         | 설명                       |
 | -------- | ------------ | -------------------------- |
 | `GET`    | `/health`    | 서버 헬스체크              |
 | `GET`    | `/hw/caps`   | 현재 HW 스냅샷             |
+| `POST`   | `/auth/signup` | 회원가입 + 토큰 발급 (USER) |
+| `POST`   | `/auth/login` | 로그인                     |
+| `GET`    | `/auth/me`   | 현재 사용자                |
 | `POST`   | `/jobs`      | 잡 생성 및 파이프라인 실행 |
 | `GET`    | `/jobs/{id}` | 잡 상태 조회               |
 | `DELETE` | `/jobs/{id}` | 잡 취소                    |
 | `WS`     | `/ws/{id}`   | 실시간 진행 스트림         |
+
+### 관리자 (PRD §10 — ADMIN 권한)
+
+| 메서드   | 경로         | 설명                       | PRD |
+| -------- | ------------ | -------------------------- | --- |
+| `GET`    | `/admin/stats` | 대시보드 카드 (사용자/잡/타이밍/GPU breakdown) | §10.1 |
+| `GET`    | `/admin/resources` | GPU/큐/디스크 현황 | §10.1 |
+| `GET`    | `/admin/jobs` | 전체 잡 (필터 지원) | §10.2 |
+| `GET`    | `/admin/jobs/{id}` | 잡 상세 + 이벤트 로그 | §10.2 |
+| `POST`   | `/admin/jobs/{id}/cancel` | 강제 취소 | §10.2 |
+| `PATCH`  | `/admin/jobs/{id}/priority` | 우선순위 변경 (1~9) | §10.2 |
+| `POST`   | `/admin/reaper/run` | Reaper 수동 트리거 (heartbeat 끊김/디스크 회수) | §10.3 |
+| CRUD     | `/admin/catalog/models[/{id}]` | 모델 카탈로그 | §10.4 |
+| CRUD     | `/admin/data-sources[/{id}]` | 데이터 소스 화이트리스트 | §10.4 |
+| CRUD     | `/admin/presets[/{id}]` | KSIC/태스크 프리셋 | §10.4 |
+| `GET`    | `/admin/users` | 사용자 목록 | |
+| `PATCH`  | `/admin/users/{id}` | 권한/활성 토글 | |
+| `GET`    | `/admin/audit` | 감사 로그 (필터: actor_email/action/date) | §10.5 |
+| `GET`    | `/admin/env/status` | 호스트 환경 진단 | |
+| `POST`   | `/admin/env/install` | 학습 패키지 자동 설치 | |
 
 ### POST /jobs 요청 파라미터
 

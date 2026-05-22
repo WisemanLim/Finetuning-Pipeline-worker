@@ -160,6 +160,9 @@ async def _run_pipeline(spec: JobSpec, req: dict[str, Any]) -> None:
     async def emit(msg: str, extra: dict | None = None) -> None:
         await _emit_ws(job_id, msg, extra)
 
+    from datetime import datetime, timezone
+    spec.started_at = datetime.now(timezone.utc)
+
     try:
         # Stage 2 — HW Probe
         await emit("Stage 2: HW 프로빙 시작")
@@ -240,16 +243,19 @@ async def _run_pipeline(spec: JobSpec, req: dict[str, Any]) -> None:
         })
 
         spec.state = JobState.DONE
+        spec.finished_at = datetime.now(timezone.utc)
 
     except WFPError as e:
         spec.state = JobState.FAILED
         spec.error_code = e.code.value
         spec.error_message = e.message
+        spec.finished_at = datetime.now(timezone.utc)
         await emit("오류 발생", {"code": e.code.value, "msg": e.message})
         log.error("pipeline_failed", extra={"job_id": job_id, "extra": e.to_dict()})
 
     except Exception as e:
         spec.state = JobState.FAILED
         spec.error_message = str(e)
+        spec.finished_at = datetime.now(timezone.utc)
         await emit("예기치 못한 오류", {"err": str(e)})
         log.exception("pipeline_crashed", extra={"job_id": job_id})

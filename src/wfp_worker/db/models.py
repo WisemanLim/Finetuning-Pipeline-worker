@@ -90,3 +90,53 @@ class ModelCatalogEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
     )
+
+
+class DataSourceWhitelist(Base):
+    """
+    데이터 소스 화이트리스트 (PRD §10.4).
+
+    사용자가 잡 생성 시 외부 데이터 소스(HF datasets, URL, API)를 지정할 때
+    이 화이트리스트에 매칭되는 패턴만 허용.
+    """
+
+    __tablename__ = "data_source_whitelist"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    name: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    # 소스 타입: hf_datasets / url / api / upload
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 매칭 패턴 (정규식 또는 prefix). 예: "huggingface.co/datasets/.*"
+    url_pattern: Mapped[str] = mapped_column(String(512), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
+    )
+
+
+class CategoryPreset(Base):
+    """
+    카테고리/프리셋 (PRD §10.4).
+
+    KSIC 분야 + 태스크 조합에 대한 추천 기본값 (모델, 학습 설정 등).
+    Stage 1/4/6에서 사용자에게 추천값으로 제시.
+    """
+
+    __tablename__ = "category_preset"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    name: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    ksic_section: Mapped[str] = mapped_column(String(2), nullable=False)
+    task_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 추천 모델 HF repo (CSV)
+    recommended_models: Mapped[str] = mapped_column(String(1024), default="")
+    # 기본 학습 설정 (JSON 문자열: lr, epochs, batch_size 등)
+    default_config_json: Mapped[str] = mapped_column(Text, default="{}")
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
+    )
