@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv
+.venv*/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage*
+
+# 빌드
+build/
+dist/
+*.egg-info/
+
+# 테스트 / 문서
+tests/
+docs/
+
+# 로컬 캐시
+~/.wfp/
+.wfp-cache/
+runs/
+checkpoints/
+artifacts/
+wandb/
+
+# Git / IDE
+.git
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# 메타
+README.md
+*.md
+.env
+.env.*
+!.env.example
+.omc/

@@ -1,0 +1,60 @@
+# =============================================================================
+# WFP ML Worker — GPU 학습 변형 (NVIDIA CUDA 12.1)
+#
+# 사용:
+#   docker build -f Dockerfile.gpu -t wfp-worker:gpu .
+#   docker run --gpus all -p 8000:8000 wfp-worker:gpu
+#
+# 또는 compose에서 deploy.resources.reservations.devices 설정.
+# =============================================================================
+
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04 AS base
+
+# Python 3.12 + 빌드 도구
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    curl \
+    ca-certificates \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       python3.12 \
+       python3.12-venv \
+       python3.12-dev \
+       build-essential \
+       libgomp1 \
+       tini \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv 설치
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    mv /root/.local/bin/uv /usr/local/bin/uv
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    VIRTUAL_ENV=/opt/venv
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+COPY src/ ./src/
+
+# train extra 포함 (torch, transformers, peft, trl, bitsandbytes)
+RUN uv venv /opt/venv --python 3.12 && \
+    VIRTUAL_ENV=/opt/venv uv pip install --no-cache ".[train]"
+
+# 비루트 유저
+RUN groupadd -r wfp && useradd -r -g wfp -d /home/wfp -m wfp && \
+    mkdir -p /home/wfp/.wfp/{models,jobs,checkpoints,artifacts} && \
+    chown -R wfp:wfp /home/wfp/.wfp /app
+
+USER wfp
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["uvicorn", "wfp_worker.server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
