@@ -143,24 +143,35 @@ curl http://localhost:8000/hw/caps | python3 -m json.tool
 
 ### Docker 기반 실행 (권장)
 
-`Finetuning-Pipeline-ops/docker/`에 통합 compose 파일이 있다.
+`Finetuning-Pipeline-ops/docker/`에 통합 compose 파일이 있다. Makefile이 호스트의 GPU 유무를 자동 감지해 CPU/GPU 모드를 선택한다.
 
 ```bash
 # Finetuning-Pipeline-ops 저장소에서
-make docker-dev              # 또는: cd docker && docker compose -f compose.dev.yaml up -d --build
+make docker-dev          # GPU 자동 감지
+make docker-dev-cpu      # CPU 강제
+make docker-dev-gpu      # GPU 강제 (nvidia 런타임 필요)
 ```
 
-워커 단독 빌드/실행:
+#### 워커 단독 빌드/실행
 
 ```bash
-# CPU 이미지
+# CPU 이미지 (multi-stage python:3.12-slim, ~1.5GB)
 docker build -t wfp-worker:latest .
 docker run -p 8000:8000 -v ~/.wfp:/home/wfp/.wfp wfp-worker:latest
 
-# GPU 이미지 (NVIDIA Container Toolkit 필요)
+# GPU 이미지 (python:3.12-slim + PyTorch +cu121 휠로 CUDA 런타임 번들, ~5GB)
 docker build -f Dockerfile.gpu -t wfp-worker:gpu .
 docker run --gpus all -p 8000:8000 -v ~/.wfp:/home/wfp/.wfp wfp-worker:gpu
 ```
+
+#### GPU 이미지 설계 노트
+
+`Dockerfile.gpu`는 `nvidia/cuda` 베이스 이미지를 **사용하지 않는다**. 대신:
+
+- 베이스: `python:3.12-slim-bookworm` (~50MB)
+- CUDA 런타임: PyTorch `+cu121` 휠에 번들된 `libcudart`/`libcublas`/`libcudnn` 등
+- 호스트 요구사항: NVIDIA 드라이버 + NVIDIA Container Toolkit (`--gpus all`)
+- 장점: apt-get 단계 최소화 (tzdata 대화형 프롬프트 회피), 멀티 스테이지 빌드로 최종 이미지 슬림
 
 자세한 Docker 가이드: [`../Finetuning-Pipeline-ops/docker/README.md`](../Finetuning-Pipeline-ops/docker/README.md)
 
