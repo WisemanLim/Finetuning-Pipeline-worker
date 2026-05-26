@@ -163,18 +163,20 @@ Docker for Mac은 Linux VM에서 동작 → MPS 미접근. Apple Silicon GPU/MPS
 make dev-worker             # uvicorn --reload (핫리로드)
 make prod-worker            # uvicorn workers=2
 
-# 인프라(postgres/redis/minio/mailhog)는 docker, worker/web은 호스트 nohup background
-make docker-dev-via-host    # = docker-infra + nohup make dev-worker + nohup make dev-web
-make docker-prod-via-host   # = docker-infra + pnpm build + nohup make prod-worker + nohup make prod-web
+# 인프라(docker) + worker/web(호스트 PM2 관리, 자동 재시작)
+make docker-dev-via-host    # = docker-infra + PM2 start wfp-worker-dev/wfp-web-dev
+make docker-prod-via-host   # = docker-infra + pnpm build + PM2 start wfp-worker-prod/wfp-web-prod
 
-make host-status            # PID 상태
-make host-logs-worker       # 워커 로그 tail
-make host-down              # 호스트 프로세스 정지 (자식까지)
+make host-status            # pm2 list
+make host-logs-worker       # pm2 logs wfp-worker-*
+make host-monit             # pm2 monit (실시간)
+make host-restart           # pm2 restart (코드 변경 반영)
+make host-down              # pm2 delete + save
 ```
 
-via-host는 내부적으로 foreground 타겟(`dev-worker`/`prod-worker`)을 `nohup $(MAKE)`로 실행 → 명령 정의 단일 소스.
+via-host는 `Finetuning-Pipeline-ops/scripts/ecosystem.config.cjs` 사용 — PM2 ecosystem에 worker dev/prod 각각 정의. 자동 재시작, 중앙 로그(`.host-logs/`), bash 래퍼로 `.env` 자동 로드.
 
-PID/로그: `Finetuning-Pipeline-ops/.host-pids/`, `.host-logs/` (gitignore 적용).
+`make bootstrap`이 uv + pnpm(corepack) + pm2 자동 설치.
 
 #### 워커 단독 빌드/실행
 
