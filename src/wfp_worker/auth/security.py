@@ -17,8 +17,14 @@ from passlib.context import CryptContext
 # Argon2id 컨텍스트
 _pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
-# JWT 비밀키 — 운영에서는 반드시 환경 변수로 교체
-_JWT_SECRET = os.environ.get("JWT_SECRET", os.environ.get("NEXTAUTH_SECRET", "dev-jwt-secret-CHANGE-ME"))
+# JWT 비밀키 — 운영에서는 반드시 환경 변수로 교체.
+# os.environ.get("K", default)은 K가 빈 문자열이면 빈 문자열 반환 → `or` 체인으로
+# 빈 값도 fallback. JWT_SECRET → NEXTAUTH_SECRET → dev default 순.
+_JWT_SECRET = (
+    os.environ.get("JWT_SECRET")
+    or os.environ.get("NEXTAUTH_SECRET")
+    or "dev-jwt-secret-CHANGE-ME"
+)
 _JWT_ALGORITHM = "HS256"
 _ACCESS_TOKEN_EXPIRE_MIN = int(os.environ.get("JWT_ACCESS_EXPIRE_MIN", "10080"))  # 7 days
 

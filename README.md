@@ -171,7 +171,7 @@ make host-status            # pm2 list
 make host-logs-worker       # pm2 logs wfp-worker-*
 make host-monit             # pm2 monit (실시간)
 make host-restart           # pm2 restart (코드 변경 반영)
-make host-down              # pm2 delete + save
+make host-down              # pm2 delete all + pm2 kill + 포트 8000 좀비 정리
 ```
 
 via-host는 `Finetuning-Pipeline-ops/scripts/ecosystem.config.cjs` 사용 — PM2 ecosystem에 worker dev/prod 각각 정의. 자동 재시작, 중앙 로그(`.host-logs/`), bash 래퍼로 `.env` 자동 로드.
