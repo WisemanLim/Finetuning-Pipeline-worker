@@ -68,6 +68,7 @@ class JobListItem(BaseModel):
 
 
 class JobDetail(JobListItem):
+    error_code: str = ""
     error_message: str = ""
     num_train: int = 0
     num_val: int = 0
@@ -80,6 +81,7 @@ class JobDetail(JobListItem):
     data_source_mode: str = ""
     data_source_path: str = ""
     keywords: list[str] = []
+    train_override: dict[str, Any] = {}
 
 
 # ─────────────────────────────────────────
@@ -106,6 +108,16 @@ async def create_job(
         )
     except WFPError as e:
         raise HTTPException(status_code=400, detail=e.to_dict()) from e
+
+    # 사용자 입력 원본 보존 — 재실행 prefill 용
+    if req.model_hf_repo:
+        spec.model_hf_repo = req.model_hf_repo
+    if req.data_source_mode:
+        from wfp_worker.common.types import DataSourceMode
+        spec.data_source_mode = DataSourceMode(req.data_source_mode)
+    spec.data_source_path = req.data_source_path or ""
+    spec.keywords = req.keywords or []
+    spec.train_override = req.train_override or {}
 
     job_id = str(spec.job_id)
     _jobs[job_id] = spec
@@ -225,11 +237,12 @@ def _to_detail(spec: JobSpec) -> JobDetail:
         num_val=spec.num_val,
         num_test=spec.num_test,
         artifacts=[a.model_dump(mode="json") for a in spec.artifacts],
-        # 재실행 prefill용
+        # 재실행 prefill용 — 사용자 입력 원본 그대로 반환
         ksic_division=spec.ksic_division,
         description=spec.description,
         language=spec.language,
         data_source_mode=spec.data_source_mode.value,
-        data_source_path=spec.dataset_path,  # 정제된 경로 — 원본 경로 보존 시 별도 필드 필요
-        keywords=[],   # 원본 keywords 보존 안 됨 — JobSpec 확장 시 추가 가능
+        data_source_path=spec.data_source_path,  # 원본 사용자 입력 (dataset_path는 정제 결과)
+        keywords=spec.keywords,
+        train_override=spec.train_override,
     )

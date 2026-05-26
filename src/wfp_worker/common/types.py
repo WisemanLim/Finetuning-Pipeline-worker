@@ -262,6 +262,8 @@ class JobSpec(BaseModel):
 
     # Stage 5 — 데이터 결과
     data_source_mode: DataSourceMode = DataSourceMode.UPLOAD
+    data_source_path: str = ""      # 사용자 입력 원본 경로/URL (재실행 prefill용)
+    keywords: list[str] = []        # web 모드 검색 키워드 원본 (재실행 prefill용)
     dataset_path: str = ""          # 정제 완료된 데이터셋 경로
     num_train: int = 0
     num_val: int = 0
@@ -269,6 +271,7 @@ class JobSpec(BaseModel):
 
     # Stage 6 — 학습 설정
     train_config: TrainConfig | None = None
+    train_override: dict[str, Any] = {}   # 사용자 고급 오버라이드 원본 (재실행 prefill용)
 
     # Stage 7 — 학습 결과
     checkpoint_dir: str = ""
