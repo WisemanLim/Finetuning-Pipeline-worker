@@ -124,7 +124,7 @@ uvicorn wfp_worker.server:app --reload --host 0.0.0.0 --port 8000
 uvicorn wfp_worker.server:app \
   --host 0.0.0.0 \
   --port 8000 \
-  --workers 2 \
+  --workers 1 \
   --log-level info
 ```
 
@@ -161,7 +161,7 @@ Docker for Mac은 Linux VM에서 동작 → MPS 미접근. Apple Silicon GPU/MPS
 ```bash
 # 호스트 직접 실행 — foreground (Ctrl+C 정지)
 make dev-worker             # uvicorn --reload (핫리로드)
-make prod-worker            # uvicorn workers=2
+make prod-worker            # uvicorn workers=1
 
 # 인프라(docker) + worker/web(호스트 PM2 관리, 자동 재시작)
 make docker-dev-via-host    # = docker-infra + PM2 start wfp-worker-dev/wfp-web-dev
@@ -491,8 +491,46 @@ http://localhost:8000/docs
 
 ## 6. HW 규칙 파일 수정
 
+### 경로 자동 탐색
+
+Worker는 다음 순서로 `hw_to_plan.yaml`을 탐색:
+
+| 우선순위 | 경로 |
+|---|---|
+| 1 | `$WFP_RULES_PATH` (env override) |
+| 2 | `/app/ops/rules/hw_to_plan.yaml` (Docker compose volume) |
+| 3 | `<worker repo>/../Finetuning-Pipeline-ops/rules/hw_to_plan.yaml` (sibling repo — 서버 표준) |
+| 4 | `<worker repo>/ops/rules/hw_to_plan.yaml` (monorepo legacy) |
+| 5 | 코드 내장 `_BUILTIN_FALLBACK_RULES` (안전망) |
+
+모두 실패 시 `WFP-0203 HW 사양에 매칭되는 플랜 규칙 없음` 에러. env로 강제 가능:
+
+```bash
+WFP_RULES_PATH=/path/to/custom/hw_to_plan.yaml make docker-prod-via-host
+```
+
 `../Finetuning-Pipeline-ops/rules/hw_to_plan.yaml`에서 GPU → 플랜 매핑 규칙을 수정한다.
 코드 재시작 없이 파일만 수정해도 다음 잡 실행 시 반영된다.
+
+### NVIDIA Unified Memory (Grace/Blackwell/Jetson, DGX Spark)
+
+vram=0 보고되는 unified memory SKU 매칭 — 시스템 RAM이 GPU 메모리 역할:
+
+```yaml
+- id: nvidia_unified_memory_120gb_plus
+  condition:
+    gpu_vendor: nvidia
+    vram_gb_max: 1    # nvidia-smi가 'Not Supported' 반환 → vram=0
+    ram_gb_min: 120
+  plan:
+    max_model_params_b: 70
+    recommended_strategy: lora
+    recommended_quant: bf16
+    backend: cuda
+    max_seq_length: 8192
+```
+
+### 표준 GPU 규칙 예시
 
 ```yaml
 rules:

@@ -12,6 +12,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import os
+
 import yaml
 
 from wfp_worker.common.errors import WFPError, WFPErrorCode
@@ -20,10 +22,39 @@ from wfp_worker.common.types import HWCaps, Quantization, RecommendedPlan, Train
 
 log = get_logger(__name__)
 
-# 기본 규칙 파일 경로 (프로젝트 루트 기준)
-_DEFAULT_RULES_PATH = (
-    Path(__file__).parents[6] / "ops" / "rules" / "hw_to_plan.yaml"
-)
+
+def _discover_rules_path() -> Path | None:
+    """hw_to_plan.yaml 경로 자동 탐색 — 다양한 배포 형태 지원.
+
+    우선순위:
+      1. WFP_RULES_PATH 환경 변수
+      2. Docker 컨테이너 마운트 경로 (/app/ops/rules/...)
+      3. Sibling repo 구조 (worker와 ops가 형제 디렉토리)
+      4. 모노레포 구조 (worker repo 내부에 ops/)
+      5. 내장 기본 규칙 (코드)
+    """
+    env_path = os.environ.get("WFP_RULES_PATH")
+    if env_path:
+        p = Path(env_path)
+        if p.exists():
+            return p
+
+    # __file__ = .../<worker>/.venv/lib/python3.12/site-packages/wfp_worker/stage2_hw_probe/plan_recommender.py
+    # parents[6] = worker repo root
+    worker_root = Path(__file__).parents[6]
+
+    candidates = [
+        Path("/app/ops/rules/hw_to_plan.yaml"),                            # Docker mount
+        worker_root.parent / "Finetuning-Pipeline-ops" / "rules" / "hw_to_plan.yaml",  # sibling repo
+        worker_root / "ops" / "rules" / "hw_to_plan.yaml",                 # monorepo (legacy)
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+_DEFAULT_RULES_PATH = _discover_rules_path()
 
 
 class PlanRecommender:
@@ -35,7 +66,9 @@ class PlanRecommender:
     """
 
     def __init__(self, rules_path: Path | None = None) -> None:
-        path = rules_path or _DEFAULT_RULES_PATH
+        # 매 호출마다 재탐색 — env var/파일이 런타임에 바뀔 수 있음.
+        # 발견 실패 시 _load_rules 내부에서 _BUILTIN_FALLBACK_RULES 사용.
+        path = rules_path or _discover_rules_path() or Path("/nonexistent/hw_to_plan.yaml")
         self._rules: list[dict[str, Any]] = self._load_rules(path)
 
     # ─────────────────────────────────────────
@@ -204,6 +237,17 @@ class PlanRecommender:
 # 규칙 파일 없을 때 내장 폴백 (최소 집합)
 # ─────────────────────────────────────────
 _BUILTIN_FALLBACK_RULES: list[dict[str, Any]] = [
+    # NVIDIA Unified Memory (Grace/Blackwell, Jetson, DGX Spark) — vram=0 보고됨
+    {
+        "id": "builtin_nvidia_unified_memory",
+        "condition": {"gpu_vendor": "nvidia", "vram_gb_max": 1, "ram_gb_min": 32},
+        "plan": {
+            "max_model_params_b": 34, "strategies": ["lora", "qlora"],
+            "quantization": ["bf16", "int4"], "recommended_strategy": "qlora",
+            "recommended_quant": "int4", "backend": "cuda",
+            "max_seq_length": 4096, "batch_size": 2, "gradient_accumulation": 8,
+        },
+    },
     {
         "id": "builtin_nvidia_24gb",
         "condition": {"gpu_vendor": "nvidia", "vram_gb_min": 24},
