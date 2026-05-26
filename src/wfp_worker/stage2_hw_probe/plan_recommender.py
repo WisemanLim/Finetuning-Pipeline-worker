@@ -102,12 +102,73 @@ class PlanRecommender:
                 )
                 return plan
 
+        # 상세 정보 — frontend 강제 진행 확인 모달용 + WS event용
+        gpu_info = (
+            f"{caps.gpus[0].vendor}/{caps.gpus[0].name}/{caps.gpus[0].vram_gb}GB"
+            if caps.gpus else "none"
+        )
+        tried_ids = [r.get("id", "?") for r in self._rules]
         raise WFPError(
             code=WFPErrorCode.NO_PLAN_MATCH,
             message="HW 사양에 매칭되는 플랜 규칙이 없습니다.",
             stage=2,
-            detail=f"VRAM={caps.max_vram_gb}GB, RAM={caps.ram_gb}GB, OS={caps.os}",
+            detail=(
+                f"OS={caps.os}/{caps.arch}, RAM={caps.ram_gb}GB, "
+                f"GPU={gpu_info}, max_VRAM={caps.max_vram_gb}GB, "
+                f"CUDA={caps.cuda_available}, MPS={caps.mps_available}. "
+                f"검토한 규칙 {len(self._rules)}개: {', '.join(tried_ids[:10])}"
+                f"{'...' if len(tried_ids) > 10 else ''}"
+            ),
         )
+
+    def force_fallback_plan(self, caps: HWCaps) -> RecommendedPlan:
+        """매칭 실패 시 사용자 동의로 강제 진행 — HW 기반 최소 안전 plan 생성.
+
+        규칙 매칭 실패 + 사용자 confirm → 이 메서드로 fallback plan 즉석 생성.
+        WS warning event로 사용자에게 표시 권장.
+        """
+        has_gpu = bool(caps.gpus)
+        cuda = caps.cuda_available
+        mps = caps.mps_available
+
+        if has_gpu and cuda:
+            backend = "cuda"
+            # vram 0 (unified memory)이면 ram 기반, 그 외 vram 기반
+            mem_gb = caps.max_vram_gb if caps.max_vram_gb >= 4 else caps.ram_gb
+            if mem_gb >= 60:
+                params, seq, batch = 13.0, 2048, 2
+            elif mem_gb >= 24:
+                params, seq, batch = 8.0, 2048, 2
+            else:
+                params, seq, batch = 3.0, 1024, 1
+        elif has_gpu and mps:
+            backend, params, seq, batch = "mps", 3.0, 1024, 1
+        else:
+            backend, params, seq, batch = "cpu", 1.0, 512, 1
+
+        log.warning(
+            "강제 fallback plan 생성 — 사용자 동의로 매칭 규칙 우회",
+            extra={"stage": 2, "extra": {
+                "backend": backend, "max_params_b": params,
+                "ram_gb": caps.ram_gb, "vram_gb": caps.max_vram_gb,
+            }},
+        )
+
+        return self._build_plan({
+            "id": "force_fallback_user_consent",
+            "plan": {
+                "max_model_params_b": params,
+                "strategies": ["qlora"],
+                "quantization": ["int4"],
+                "recommended_strategy": "qlora",
+                "recommended_quant": "int4",
+                "backend": backend,
+                "max_seq_length": seq,
+                "batch_size": batch,
+                "gradient_accumulation": 8 if backend != "cpu" else 32,
+                "warning": "사용자 동의로 강제 진행 — 표준 규칙 매칭 실패. 학습 결과 보장 안 됨.",
+            },
+        })
 
     # ─────────────────────────────────────────
     # 내부 구현

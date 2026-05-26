@@ -15,7 +15,7 @@ from typing import Any, Deque
 
 from fastapi import WebSocket
 
-from wfp_worker.common.errors import WFPError
+from wfp_worker.common.errors import WFPError, WFPErrorCode
 from wfp_worker.common.logger import get_logger
 from wfp_worker.common.types import DataSourceMode, JobSpec, JobState
 
@@ -169,7 +169,30 @@ async def _run_pipeline(spec: JobSpec, req: dict[str, Any]) -> None:
         from wfp_worker.stage2_hw_probe import HWProber, PlanRecommender
         caps = await asyncio.to_thread(HWProber().probe)
         spec.hw_caps = caps
-        plan = await asyncio.to_thread(PlanRecommender().recommend, caps)
+        recommender = PlanRecommender()
+        try:
+            plan = await asyncio.to_thread(recommender.recommend, caps)
+        except WFPError as e:
+            if e.code == WFPErrorCode.NO_PLAN_MATCH and req.get("allow_force_plan"):
+                # 사용자 동의로 강제 진행 — fallback plan 생성 + 경고 broadcast
+                await emit(
+                    f"⚠ [{e.code.value}] {e.message} — 사용자 동의로 강제 진행",
+                    {"stage": 2, "warning": True, "force_plan": True, "detail": e.detail},
+                )
+                plan = await asyncio.to_thread(recommender.force_fallback_plan, caps)
+                await emit(
+                    f"강제 fallback plan 적용: {plan.backend} / max {plan.max_model_params_b}B / {plan.recommended_strategy}",
+                    {"stage": 2, "warning": True, "force_plan": True,
+                     "max_params_b": plan.max_model_params_b, "backend": plan.backend},
+                )
+            else:
+                # detail 정보를 WS event에도 노출 (사용자 confirmation 화면용)
+                await emit(
+                    f"[{e.code.value}] {e.message}",
+                    {"stage": 2, "code": e.code.value, "detail": e.detail,
+                     "can_force": e.code == WFPErrorCode.NO_PLAN_MATCH},
+                )
+                raise
         spec.recommended_plan = plan
         await emit("Stage 2 완료", {"max_vram_gb": caps.max_vram_gb, "stage": 2})
 

@@ -54,6 +54,8 @@ class JobCreateRequest(BaseModel):
     data_source_path: str = ""
     keywords: list[str] = []
     train_override: dict[str, Any] = {}
+    # 사용자 동의 시 HW 규칙 매칭 실패에도 fallback plan으로 강제 진행 (PRD §8 예외 처리)
+    allow_force_plan: bool = False
 
 
 class JobListItem(BaseModel):
