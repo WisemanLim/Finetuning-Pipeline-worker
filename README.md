@@ -145,12 +145,30 @@ curl http://localhost:8000/hw/caps | python3 -m json.tool
 
 `Finetuning-Pipeline-ops/docker/`에 통합 compose 파일이 있다. Makefile이 호스트의 GPU 유무를 자동 감지해 CPU/GPU 모드를 선택한다.
 
+#### 전체 컨테이너 모드
+
 ```bash
 # Finetuning-Pipeline-ops 저장소에서
-make docker-dev          # GPU 자동 감지
+make docker-dev          # GPU 자동 감지 (worker 컨테이너 안에서 실행)
 make docker-dev-cpu      # CPU 강제
 make docker-dev-gpu      # GPU 강제 (nvidia 런타임 필요)
 ```
+
+#### 하이브리드 모드 (인프라 docker + worker 호스트)
+
+Docker for Mac은 Linux VM에서 동작 → MPS 미접근. Apple Silicon GPU/MPS, 호스트 NVIDIA GPU 직접 접근, 빠른 핫리로드, 직접 디버깅을 원할 때 사용.
+
+```bash
+# 인프라(postgres/redis/minio/mailhog)는 docker, worker/web은 호스트 nohup background
+make docker-dev-via-host    # uvicorn --reload + pnpm dev
+make docker-prod-via-host   # uvicorn workers=2 + pnpm build/start
+
+make host-status            # PID 상태
+make host-logs-worker       # 워커 로그 tail
+make host-down              # 호스트 프로세스 정지
+```
+
+PID/로그: `Finetuning-Pipeline-ops/.host-pids/`, `.host-logs/` (gitignore 적용).
 
 #### 워커 단독 빌드/실행
 
