@@ -51,8 +51,56 @@ def _probe_cpu() -> CPUInfo:
         )
 
 
+def _probe_nvidia_via_smi() -> list[GPUInfo]:
+    """`nvidia-smi --query-gpu` fallback — pynvml NVML init 실패 시 사용.
+
+    aarch64 NVIDIA Open Kernel Module 등 일부 환경에서 pynvml은 'Not Supported'.
+    nvidia-smi는 CLI라 NVML 라이브러리 ABI에 덜 민감.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("nvidia-smi") is None:
+        return []
+
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.total,temperature.gpu,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+    except Exception as e:
+        log.debug("nvidia-smi 호출 실패", extra={"extra": {"err": str(e)}})
+        return []
+
+    gpus: list[GPUInfo] = []
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            idx = int(parts[0])
+            name = parts[1]
+            vram_mib = float(parts[2])
+            temp = float(parts[3]) if len(parts) > 3 and parts[3] not in ("", "[N/A]") else 0.0
+            util = float(parts[4]) if len(parts) > 4 and parts[4] not in ("", "[N/A]") else 0.0
+        except ValueError:
+            continue
+        gpus.append(GPUInfo(
+            index=idx, name=name, vendor="nvidia",
+            vram_gb=round(vram_mib / 1024, 2),
+            compute_capability="",  # nvidia-smi에 표준 컬럼 없음
+            utilization_pct=util,
+            temperature_c=temp,
+        ))
+    return gpus
+
+
 def _probe_nvidia_gpus() -> list[GPUInfo]:
-    """NVIDIA GPU 정보 수집 (pynvml 사용)."""
+    """NVIDIA GPU 정보 수집 — pynvml 우선, 실패 시 nvidia-smi fallback."""
     try:
         import pynvml
 
@@ -101,14 +149,22 @@ def _probe_nvidia_gpus() -> list[GPUInfo]:
             ))
 
         pynvml.nvmlShutdown()
-        return gpus
+        if gpus:
+            return gpus
+        # NVML init 성공했지만 0개 — fallback 시도
+        log.debug("NVML 0개 GPU 보고 — nvidia-smi fallback 시도")
+        return _probe_nvidia_via_smi()
 
     except ImportError:
-        log.debug("pynvml 미설치 — NVIDIA GPU 감지 생략")
-        return []
+        log.debug("pynvml 미설치 — nvidia-smi fallback")
+        return _probe_nvidia_via_smi()
     except Exception as e:
-        log.warning("NVIDIA GPU 감지 실패", extra={"extra": {"err": str(e)}})
-        return []
+        # NVML init 실패 (예: aarch64 Open Kernel Module) — nvidia-smi로 fallback
+        log.info(
+            "pynvml 사용 불가 — nvidia-smi fallback",
+            extra={"extra": {"err": str(e)}},
+        )
+        return _probe_nvidia_via_smi()
 
 
 def _probe_apple_gpu(unified_mem_gb: float) -> list[GPUInfo]:
