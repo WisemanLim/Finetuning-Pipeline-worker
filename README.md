@@ -159,14 +159,20 @@ make docker-dev-gpu      # GPU 강제 (nvidia 런타임 필요)
 Docker for Mac은 Linux VM에서 동작 → MPS 미접근. Apple Silicon GPU/MPS, 호스트 NVIDIA GPU 직접 접근, 빠른 핫리로드, 직접 디버깅을 원할 때 사용.
 
 ```bash
+# 호스트 직접 실행 — foreground (Ctrl+C 정지)
+make dev-worker             # uvicorn --reload (핫리로드)
+make prod-worker            # uvicorn workers=2
+
 # 인프라(postgres/redis/minio/mailhog)는 docker, worker/web은 호스트 nohup background
-make docker-dev-via-host    # uvicorn --reload + pnpm dev
-make docker-prod-via-host   # uvicorn workers=2 + pnpm build/start
+make docker-dev-via-host    # = docker-infra + nohup make dev-worker + nohup make dev-web
+make docker-prod-via-host   # = docker-infra + pnpm build + nohup make prod-worker + nohup make prod-web
 
 make host-status            # PID 상태
 make host-logs-worker       # 워커 로그 tail
-make host-down              # 호스트 프로세스 정지
+make host-down              # 호스트 프로세스 정지 (자식까지)
 ```
+
+via-host는 내부적으로 foreground 타겟(`dev-worker`/`prod-worker`)을 `nohup $(MAKE)`로 실행 → 명령 정의 단일 소스.
 
 PID/로그: `Finetuning-Pipeline-ops/.host-pids/`, `.host-logs/` (gitignore 적용).
 
