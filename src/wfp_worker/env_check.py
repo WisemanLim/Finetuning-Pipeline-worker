@@ -151,13 +151,24 @@ def _make_install_cmd(profile: str) -> str:
 def _resolve_torch_index(profile: str, caps) -> str | None:
     """PyTorch wheel index 동적 결정.
 
-    aarch64 + NVIDIA (Grace/Blackwell/Jetson) → 표준 cu121은 x86_64 only → nightly cu126으로.
+    aarch64 + NVIDIA (Grace+Blackwell/Jetson) → SM 10.x 포함된 nightly cu128 권장.
+    aarch64 + NVIDIA + 옛 GPU → nightly cu126.
     그 외 NVIDIA → 표준 cu121.
+
+    NOTE: 환경 변수 WFP_TORCH_INDEX로 사용자 override 가능.
     """
+    import os
+    if override := os.environ.get("WFP_TORCH_INDEX"):
+        return override
     if profile != "nvidia":
         return PROFILES[profile]["torch_index"]
     import platform
     if platform.machine().lower() in ("aarch64", "arm64"):
+        # Blackwell (SM 10.x): cu128 nightly. 그 외 aarch64는 cu126.
+        # GPU 이름 휴리스틱 — GB10, B100, B200 등 Blackwell 키워드 매칭.
+        gpu_names = " ".join(g.name for g in (caps.gpus or [])).upper()
+        if any(k in gpu_names for k in ("GB10", "B100", "B200", "BLACKWELL")):
+            return "https://download.pytorch.org/whl/nightly/cu128"
         return "https://download.pytorch.org/whl/nightly/cu126"
     return PROFILES["nvidia"]["torch_index"]
 
