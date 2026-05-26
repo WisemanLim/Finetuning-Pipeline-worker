@@ -290,6 +290,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description="WFP 환경 진단 + 자동 설치")
     p.add_argument("--install", action="store_true", help="누락 패키지 자동 설치")
     p.add_argument("--json", action="store_true", help="JSON 출력")
+    p.add_argument("--strict", action="store_true",
+                   help="진단 실패(누락 패키지)를 exit code로 표시 (CI/스크립트용). 기본은 정보 출력만 후 exit 0.")
     args = p.parse_args()
 
     diag = diagnose()
@@ -308,7 +310,10 @@ def main() -> int:
             print(f"stderr: {result['stderr'][-500:]}")
         return 0 if result["status"] == "ok" else 1
 
-    return 0 if diag.is_ready else 2
+    # 단순 진단은 항상 exit 0 (정보 출력만). --strict 일 때만 누락 시 exit 2.
+    if args.strict and not diag.is_ready:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
