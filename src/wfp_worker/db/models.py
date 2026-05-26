@@ -92,6 +92,31 @@ class ModelCatalogEntry(Base):
     )
 
 
+class AdminNotification(Base):
+    """사용자 → 관리자 알림 (PRD §10.5 보조).
+
+    잡 실행 중 환경/리소스 문제로 실패 시 사용자가 한 번 클릭으로 관리자에게 전송.
+    관리자 대시보드에서 누적 확인 + 자동 조치(예: 패키지 설치) 가능.
+    """
+
+    __tablename__ = "admin_notifications"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    user_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    user_email: Mapped[str] = mapped_column(String(255), nullable=False)
+    job_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    # 분류 — env_missing / hw_mismatch / quota / other
+    kind: Mapped[str] = mapped_column(String(32), default="other", index=True)
+    error_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    # 누락 패키지 / 부가 정보 (JSON 문자열)
+    detail_json: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(16), default="new", index=True)  # new / read / resolved
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
 class DataSourceWhitelist(Base):
     """
     데이터 소스 화이트리스트 (PRD §10.4).

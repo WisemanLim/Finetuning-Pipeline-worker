@@ -198,7 +198,19 @@ def diagnose() -> EnvDiagnosis:
     if profile == "nvidia" and not caps.cuda_available:
         warnings.append("NVIDIA GPU 감지되었으나 CUDA 비활성 — 드라이버 또는 torch CUDA 빌드 확인 필요.")
     if profile == "apple" and not caps.mps_available:
-        warnings.append("Apple Silicon 감지되었으나 MPS 비활성 — torch>=2.0 mac wheel 필요.")
+        # torch 미설치인지 vs 설치됐는데 MPS 불가인지 구분
+        torch_installed = "torch" in installed
+        if not torch_installed:
+            warnings.append(
+                "Apple Silicon 감지 — MPS 사용을 위해 torch 학습 패키지 설치 필요. "
+                "uv pip install -e '.[train]' --python .venv/bin/python"
+            )
+        else:
+            warnings.append(
+                "Apple Silicon 감지 + torch 설치됨 — MPS 비활성. "
+                "macOS 12.3+ 필요. torch가 CPU-only wheel일 경우 mac 전용 wheel로 재설치: "
+                "uv pip install -U torch --python .venv/bin/python"
+            )
 
     return EnvDiagnosis(
         os=caps.os,

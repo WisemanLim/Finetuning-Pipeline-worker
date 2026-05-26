@@ -154,14 +154,20 @@ class PlanRecommender:
             }},
         )
 
+        # backend별 양자화 가능 여부 — MPS/CPU는 bitsandbytes 미지원 → LoRA + bf16
+        if backend == "cuda":
+            strategy, quant = "qlora", "int4"
+        else:
+            strategy, quant = "lora", "bf16"
+
         return self._build_plan({
             "id": "force_fallback_user_consent",
             "plan": {
                 "max_model_params_b": params,
-                "strategies": ["qlora"],
-                "quantization": ["int4"],
-                "recommended_strategy": "qlora",
-                "recommended_quant": "int4",
+                "strategies": [strategy],
+                "quantization": [quant],
+                "recommended_strategy": strategy,
+                "recommended_quant": quant,
                 "backend": backend,
                 "max_seq_length": seq,
                 "batch_size": batch,
@@ -330,13 +336,15 @@ _BUILTIN_FALLBACK_RULES: list[dict[str, Any]] = [
         },
     },
     {
+        # Apple Silicon — bitsandbytes/int4 미지원 → LoRA + bf16
         "id": "builtin_apple",
         "condition": {"gpu_vendor": "apple"},
         "plan": {
-            "max_model_params_b": 7, "strategies": ["qlora"],
-            "quantization": ["int4"], "recommended_strategy": "qlora",
-            "recommended_quant": "int4", "backend": "mps",
+            "max_model_params_b": 7, "strategies": ["lora"],
+            "quantization": ["bf16"], "recommended_strategy": "lora",
+            "recommended_quant": "bf16", "backend": "mps",
             "max_seq_length": 2048, "batch_size": 1, "gradient_accumulation": 8,
+            "warning": "Apple Silicon — bitsandbytes 미지원. LoRA + bf16 사용.",
         },
     },
     {

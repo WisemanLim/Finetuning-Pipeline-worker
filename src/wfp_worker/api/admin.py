@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 
 from wfp_worker.auth import get_current_admin
 from wfp_worker.db import (
+    AdminNotification,
     AuditLog,
     CategoryPreset,
     DataSourceWhitelist,
@@ -142,9 +143,12 @@ def patch_user(
 class AdminJobItem(BaseModel):
     job_id: str
     user_id: str
+    user_email: str = ""        # UUID 대신 표시용 이메일
+    user_name: str = ""         # User.name (옵션 — 비어있을 수 있음)
     state: str
     current_stage: int
     ksic_section: str
+    task_type: str = ""
     model_hf_repo: str
     created_at: str | None
 
@@ -157,10 +161,18 @@ def list_all_jobs(
     date_from: str = "",
     date_to: str = "",
     limit: int = 200,
+    db: Session = Depends(get_db),
     _: User = Depends(get_current_admin),
 ) -> list[AdminJobItem]:
     dt_from = datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc) if date_from else None
     dt_to = datetime.fromisoformat(date_to).replace(tzinfo=timezone.utc) if date_to else None
+
+    # 한번에 user_id → email/name lookup (N+1 쿼리 회피)
+    user_ids = {spec.user_id for spec in _jobs.values() if spec.user_id}
+    user_map: dict[str, tuple[str, str]] = {}  # id → (email, name)
+    if user_ids:
+        for u in db.query(User).filter(User.id.in_(user_ids)).all():
+            user_map[u.id] = (u.email, u.name or "")
 
     items = []
     for spec in _jobs.values():
@@ -174,10 +186,14 @@ def list_all_jobs(
             continue
         if dt_to and spec.created_at and spec.created_at > dt_to:
             continue
+        email, name = user_map.get(spec.user_id, ("", ""))
         items.append(AdminJobItem(
             job_id=str(spec.job_id), user_id=spec.user_id,
+            user_email=email, user_name=name,
             state=spec.state.value, current_stage=spec.current_stage,
-            ksic_section=spec.ksic_section, model_hf_repo=spec.model_hf_repo,
+            ksic_section=spec.ksic_section,
+            task_type=spec.task_type.value if hasattr(spec.task_type, "value") else str(spec.task_type),
+            model_hf_repo=spec.model_hf_repo,
             created_at=spec.created_at.isoformat() if spec.created_at else None,
         ))
     items.sort(key=lambda x: x.created_at or "", reverse=True)
@@ -870,3 +886,77 @@ def delete_preset(
     entry.is_active = False
     db.commit()
     _audit(db, actor, "preset_delete", target=entry_id, detail=entry.name)
+
+
+# ─────────────────────────────────────────
+# 사용자 → 관리자 알림 (PRD §10.5)
+# ─────────────────────────────────────────
+
+
+class NotificationItem(BaseModel):
+    id: str
+    user_id: str
+    user_email: str
+    job_id: str | None = None
+    kind: str
+    error_code: str | None = None
+    message: str
+    detail: dict
+    status: str
+    created_at: str
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+
+
+def _to_notif(n: AdminNotification) -> NotificationItem:
+    return NotificationItem(
+        id=n.id, user_id=n.user_id, user_email=n.user_email, job_id=n.job_id,
+        kind=n.kind, error_code=n.error_code, message=n.message,
+        detail=json.loads(n.detail_json or "{}"),
+        status=n.status,
+        created_at=n.created_at.isoformat() if n.created_at else "",
+        resolved_at=n.resolved_at.isoformat() if n.resolved_at else None,
+        resolved_by=n.resolved_by,
+    )
+
+
+@router.get("/notifications", response_model=list[NotificationItem])
+def list_notifications(
+    status_filter: str = "",
+    kind: str = "",
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_admin),
+) -> list[NotificationItem]:
+    """관리자 알림 목록. status=new/read/resolved, kind=env_missing/hw_mismatch/other 필터."""
+    q = db.query(AdminNotification)
+    if status_filter:
+        q = q.filter(AdminNotification.status == status_filter)
+    if kind:
+        q = q.filter(AdminNotification.kind == kind)
+    rows = q.order_by(AdminNotification.created_at.desc()).limit(limit).all()
+    return [_to_notif(n) for n in rows]
+
+
+class NotificationPatch(BaseModel):
+    status: str = Field(pattern="^(new|read|resolved)$")
+
+
+@router.patch("/notifications/{notif_id}", response_model=NotificationItem)
+def patch_notification(
+    notif_id: str,
+    body: NotificationPatch,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> NotificationItem:
+    n = db.get(AdminNotification, notif_id)
+    if not n:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    n.status = body.status
+    if body.status == "resolved":
+        n.resolved_at = datetime.now(timezone.utc)
+        n.resolved_by = actor.id
+    db.commit()
+    db.refresh(n)
+    _audit(db, actor, "notification_patch", target=notif_id, detail=body.status)
+    return _to_notif(n)

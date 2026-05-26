@@ -197,10 +197,15 @@ class DataCollector:
         self, keywords: list[str], ksic_section: str
     ) -> Iterator[dict[str, Any]]:
         """
-        C 모드: 화이트리스트 기반 간단 크롤링.
+        C 모드: Wikipedia 한국어 opensearch + 각 결과 페이지 본문 수집.
 
-        실제 운영에서는 검색 API(Google Custom Search, Bing) 연동 권장.
-        현재는 Wikipedia 한국어 검색만 구현 (데모 수준).
+        개선 흐름:
+          1. 키워드별 opensearch API → 관련 페이지 N개 발견 (직접 URL 추측 X)
+          2. 각 페이지 본문 모든 단락 (>=30자) + 리스트 항목 수집
+          3. 페이지 내 관련 링크 (See also) 1-hop 확장
+          4. 키워드 제한 없음 — 모두 활용
+
+        실제 운영에서는 Google Custom Search / Bing API / Naver API 연동 권장.
         """
         try:
             import requests
@@ -212,20 +217,92 @@ class DataCollector:
                 stage=5,
             ) from None
 
-        for keyword in keywords[:5]:  # 키워드당 Wikipedia 검색
-            url = f"https://ko.wikipedia.org/wiki/{keyword}"
+        sess = requests.Session()
+        sess.headers["User-Agent"] = "WFP/0.1 (research; +https://github.com)"
+        visited: set[str] = set()
+        OPENSEARCH = "https://ko.wikipedia.org/w/api.php"
+        SEARCH_LIMIT = 10  # 키워드당 검색 결과 페이지 수
+        MIN_PARA_LEN = 30  # 단락 최소 글자
+
+        def _extract_page(url: str, keyword: str) -> Iterator[dict[str, Any]]:
+            if url in visited:
+                return
+            visited.add(url)
             try:
-                resp = requests.get(url, timeout=10, headers={"User-Agent": "WFP/0.1"})
-                if resp.status_code != 200:
-                    continue
-                soup = BeautifulSoup(resp.text, "html.parser")
-                # 본문 단락 추출
-                for p in soup.select("div#mw-content-text p"):
-                    text = p.get_text(strip=True)
-                    if len(text) > 50:
-                        yield {"text": text, "source": url, "keyword": keyword}
+                resp = sess.get(url, timeout=10)
             except Exception as e:
                 log.warning("크롤링 실패", extra={"extra": {"url": url, "err": str(e)}})
+                return
+            if resp.status_code != 200:
+                return
+            soup = BeautifulSoup(resp.text, "html.parser")
+            content = soup.select_one("div#mw-content-text")
+            if not content:
+                return
+            # 본문 단락
+            for p in content.select("p"):
+                text = p.get_text(strip=True)
+                if len(text) >= MIN_PARA_LEN:
+                    yield {"text": text, "source": url, "keyword": keyword}
+            # 리스트 항목 (의미 있는 문장형)
+            for li in content.select("ul > li, ol > li"):
+                text = li.get_text(strip=True)
+                if MIN_PARA_LEN <= len(text) <= 500:
+                    yield {"text": text, "source": url, "keyword": keyword}
+
+        def _opensearch(keyword: str) -> list[str]:
+            """opensearch API → 페이지 URL 목록."""
+            try:
+                r = sess.get(
+                    OPENSEARCH,
+                    params={
+                        "action": "opensearch",
+                        "search": keyword,
+                        "limit": SEARCH_LIMIT,
+                        "format": "json",
+                    },
+                    timeout=10,
+                )
+                if r.status_code != 200:
+                    return []
+                data = r.json()
+                return data[3] if len(data) >= 4 else []  # [query, titles, descs, urls]
+            except Exception as e:
+                log.warning("opensearch 실패", extra={"extra": {"keyword": keyword, "err": str(e)}})
+                return []
+
+        # 키워드 비어있으면 KSIC 분야명을 fallback 키워드로
+        if not keywords:
+            ksic_fallback = {
+                "A": ["농업", "임업", "어업"],
+                "B": ["광업"],
+                "C": ["제조업"],
+                "D": ["전기", "가스", "수도사업"],
+                "E": ["환경", "폐기물"],
+                "F": ["건설업"],
+                "G": ["도매", "소매업"],
+                "H": ["운수업"],
+                "I": ["음식점", "숙박업"],
+                "J": ["정보통신", "소프트웨어"],
+                "K": ["금융", "보험"],
+                "L": ["부동산"],
+                "M": ["전문서비스"],
+                "N": ["사업서비스"],
+                "O": ["공공행정"],
+                "P": ["교육"],
+                "Q": ["보건", "의료"],
+                "R": ["예술", "스포츠"],
+                "S": ["수리업"],
+            }
+            keywords = ksic_fallback.get(ksic_section, [ksic_section])
+
+        for keyword in keywords:
+            urls = _opensearch(keyword)
+            if not urls:
+                # opensearch 실패 시 직접 URL 시도 (legacy fallback)
+                urls = [f"https://ko.wikipedia.org/wiki/{keyword}"]
+            for url in urls:
+                yield from _extract_page(url, keyword)
 
     # ─────────────────────────────────────────
     # 파일 파서

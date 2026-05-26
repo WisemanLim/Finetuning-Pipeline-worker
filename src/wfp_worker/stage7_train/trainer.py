@@ -278,6 +278,22 @@ class PipelineTrainer:
             data_files={"train": train_file, "validation": val_file},
         )
 
+        # TRL >=0.12 호환: 'text' 컬럼 강제 생성 — instruction/input/output → 단일 학습 텍스트.
+        # 옛 SFTTrainer는 dataset_text_field 인자로 처리. 신 버전은 'text' 컬럼 자체를 기대.
+        def _build_text(ex: dict) -> dict:
+            instr = ex.get("instruction") or ""
+            inp = ex.get("input") or ""
+            out = ex.get("output") or ""
+            if inp:
+                text = f"### 지시:\n{instr}\n\n### 입력:\n{inp}\n\n### 응답:\n{out}"
+            else:
+                text = f"### 지시:\n{instr}\n\n### 응답:\n{out}"
+            return {"text": text}
+
+        sample = dataset["train"][0] if len(dataset["train"]) else {}
+        if "text" not in sample:
+            dataset = dataset.map(_build_text)
+
         training_args = TrainingArguments(
             output_dir=config.output_dir,
             num_train_epochs=config.num_epochs,
@@ -292,51 +308,84 @@ class PipelineTrainer:
             logging_steps=config.logging_steps,
             fp16=config.fp16,
             bf16=config.bf16,
-            evaluation_strategy="steps",
+            eval_strategy="steps",   # transformers >=4.41 (옛 evaluation_strategy 제거됨)
             save_strategy="steps",
             load_best_model_at_end=True,
             report_to=["tensorboard"],
         )
 
-        return SFTTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            args=training_args,
-            train_dataset=dataset["train"],
-            eval_dataset=dataset.get("validation"),
-            max_seq_length=config.max_seq_length,
-            dataset_text_field="instruction",
-            packing=False,
-            callbacks=[self._make_progress_callback(spec)],
-        )
+        # TRL >=0.12 호환: tokenizer → processing_class, max_seq_length/dataset_text_field/packing → SFTConfig.
+        # 옛/신 양쪽 호환 시도 — TypeError 시 fallback.
+        from inspect import signature
+        sft_kwargs: dict = {
+            "model": model,
+            "args": training_args,
+            "train_dataset": dataset["train"],
+            "eval_dataset": dataset.get("validation"),
+            "callbacks": [self._make_progress_callback(spec)],
+        }
+        sig_params = set(signature(SFTTrainer.__init__).parameters.keys())
+        # tokenizer 인자 이름
+        if "processing_class" in sig_params:
+            sft_kwargs["processing_class"] = tokenizer
+        else:
+            sft_kwargs["tokenizer"] = tokenizer
+        # SFTTrainer 직접 인자 또는 args(SFTConfig) 안으로 이동
+        for k, v in {
+            "max_seq_length": config.max_seq_length,
+            "dataset_text_field": "text",   # 사전 map으로 생성한 단일 학습 텍스트 컬럼
+            "packing": False,
+        }.items():
+            if k in sig_params:
+                sft_kwargs[k] = v
+            elif hasattr(training_args, k):
+                setattr(training_args, k, v)
+        return SFTTrainer(**sft_kwargs)
 
     def _make_progress_callback(self, spec: JobSpec):
-        """학습 진행 콜백 → ProgressCallback 변환."""
+        """학습 진행 콜백 — Step 단위 progress + loss 이벤트 발행."""
         from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
         cb = self._progress_cb
 
         class _WFPCallback(TrainerCallback):
-            def on_log(
-                self,
-                args: TrainingArguments,
-                state: TrainerState,
-                control: TrainerControl,
-                logs: dict | None = None,
-                **kwargs: Any,
-            ) -> None:
-                if logs:
-                    cb(
-                        str(spec.job_id),
-                        7,
-                        f"Step {state.global_step}",
-                        {
-                            "loss": logs.get("loss"),
-                            "eval_loss": logs.get("eval_loss"),
-                            "step": state.global_step,
-                            "epoch": logs.get("epoch"),
-                        },
-                    )
+            _last_emit_step = -1
+
+            def on_train_begin(self, args, state: TrainerState, control, **kwargs) -> None:
+                cb(str(spec.job_id), 7, "학습 시작",
+                   {"step": 0, "total_steps": state.max_steps, "epoch": 0,
+                    "stage_progress": 0.0})
+
+            def on_step_end(self, args, state: TrainerState, control, **kwargs) -> None:
+                # 매 step 발행하면 WS 과부하 — 1% 또는 5 step마다
+                total = max(state.max_steps, 1)
+                interval = max(1, total // 100)
+                if state.global_step - self._last_emit_step < interval:
+                    return
+                self._last_emit_step = state.global_step
+                cb(str(spec.job_id), 7,
+                   f"Step {state.global_step}/{total}",
+                   {"step": state.global_step, "total_steps": total,
+                    "epoch": state.epoch,
+                    "stage_progress": state.global_step / total})
+
+            def on_log(self, args, state: TrainerState, control,
+                       logs: dict | None = None, **kwargs) -> None:
+                if not logs:
+                    return
+                total = max(state.max_steps, 1)
+                cb(str(spec.job_id), 7,
+                   f"Step {state.global_step}/{total}",
+                   {"loss": logs.get("loss"), "eval_loss": logs.get("eval_loss"),
+                    "step": state.global_step, "total_steps": total,
+                    "epoch": logs.get("epoch"),
+                    "stage_progress": state.global_step / total})
+
+            def on_train_end(self, args, state: TrainerState, control, **kwargs) -> None:
+                total = max(state.max_steps, 1)
+                cb(str(spec.job_id), 7, "학습 완료",
+                   {"step": state.global_step, "total_steps": total,
+                    "stage_progress": 1.0})
 
         return _WFPCallback()
 

@@ -2,6 +2,7 @@
 
 from .base import Base
 from .models import (
+    AdminNotification,
     AuditLog,
     CategoryPreset,
     DataSourceWhitelist,
@@ -22,6 +23,7 @@ __all__ = [
     "User",
     "UserRole",
     "AuditLog",
+    "AdminNotification",
     "ModelCatalogEntry",
     "DataSourceWhitelist",
     "CategoryPreset",

@@ -234,19 +234,35 @@ def _probe_amd_gpus() -> list[GPUInfo]:
 
 
 def _check_torch_backends() -> tuple[bool, bool]:
-    """torch 레벨 CUDA / MPS 가용 여부 확인."""
+    """torch 레벨 CUDA / MPS 가용 여부 확인.
+
+    torch 미설치 시:
+      - macOS + Apple Silicon (arm64) → MPS capable로 간주 (학습 패키지 설치 시 자동 활성)
+      - 그 외 → False
+    """
+    import platform
+    is_macos_arm = sys.platform == "darwin" and platform.machine() in ("arm64", "aarch64")
     try:
         import torch
 
         cuda_ok = torch.cuda.is_available()
-        mps_ok = (
-            sys.platform == "darwin"
-            and hasattr(torch.backends, "mps")
-            and torch.backends.mps.is_available()
-        )
+        # MPS: is_available() 우선, 실패 시 is_built() fallback (torch wheel이 MPS 포함하지만 device 없음 케이스)
+        mps_ok = False
+        if sys.platform == "darwin" and hasattr(torch.backends, "mps"):
+            try:
+                mps_ok = torch.backends.mps.is_available()
+            except Exception:
+                mps_ok = False
+            if not mps_ok and hasattr(torch.backends.mps, "is_built"):
+                try:
+                    mps_ok = torch.backends.mps.is_built() and is_macos_arm
+                except Exception:
+                    pass
         return cuda_ok, mps_ok
     except ImportError:
-        return False, False
+        # torch 미설치 — macOS Apple Silicon이면 MPS capable로 표시 (UI/규칙 매칭용)
+        # 학습 시점에 torch 설치 필수. is_macos_arm 자체는 환경 진단 신호.
+        return False, is_macos_arm
 
 
 def _estimate_network_speed() -> float:

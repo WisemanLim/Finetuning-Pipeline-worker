@@ -52,10 +52,38 @@ _PERSIST_DIR = Path("/data") if Path("/data").exists() else Path.home() / ".wfp"
 _PERSIST_PATH = _PERSIST_DIR / "jobs_state.json"
 
 
+_BACKUP_KEEP = 5  # 최근 N개 회전 백업 유지
+
+
+def _rotate_backup() -> None:
+    """덮어쓰기 전 jobs_state.json 회전 백업.
+
+    실수 삭제 / 손상 시 복구 가능. jobs_state.json.1 ~ jobs_state.json.N 형태.
+    """
+    if not _PERSIST_PATH.exists():
+        return
+    try:
+        # N → N+1 (가장 오래된 것 삭제)
+        oldest = _PERSIST_PATH.with_suffix(f".json.{_BACKUP_KEEP}")
+        if oldest.exists():
+            oldest.unlink()
+        for i in range(_BACKUP_KEEP - 1, 0, -1):
+            src = _PERSIST_PATH.with_suffix(f".json.{i}")
+            if src.exists():
+                src.rename(_PERSIST_PATH.with_suffix(f".json.{i + 1}"))
+        # 현재 → .1
+        import shutil
+        shutil.copy2(_PERSIST_PATH, _PERSIST_PATH.with_suffix(".json.1"))
+    except Exception as e:
+        log.debug("backup rotate 실패", extra={"extra": {"err": str(e)}})
+
+
 def save_state() -> None:
-    """잡 메타데이터 + 이벤트 buffer를 디스크에 atomic write."""
+    """잡 메타데이터 + 이벤트 buffer를 디스크에 atomic write + 회전 백업."""
     try:
         _PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+        # 덮어쓰기 전 이전 버전 백업 (실수 삭제 복구용)
+        _rotate_backup()
         payload = {
             "jobs": {jid: spec.model_dump(mode="json") for jid, spec in _jobs.items()},
             "events": {jid: list(buf) for jid, buf in _job_events.items()},

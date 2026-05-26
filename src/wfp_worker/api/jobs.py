@@ -28,7 +28,7 @@ from wfp_worker.auth import get_current_user
 from wfp_worker.common.errors import WFPError
 from wfp_worker.common.logger import get_logger
 from wfp_worker.common.types import ArtifactKind, JobSpec, JobState
-from wfp_worker.db import User, get_db
+from wfp_worker.db import AdminNotification, User, get_db
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -134,6 +134,94 @@ async def create_job(
     return {"job_id": job_id, "state": spec.state.value}
 
 
+# ─────────────────────────────────────────
+# 사용자 → 관리자 알림 (PRD §10.5)
+# 동적 라우트 /{job_id} 보다 위에 등록 — 정적 경로가 우선 매칭되도록.
+# ─────────────────────────────────────────
+
+
+class NotifyAdminRequest(BaseModel):
+    """잡 실패 등 환경 문제 발생 시 사용자가 관리자에게 보내는 알림."""
+    job_id: str | None = None
+    kind: str = "other"            # env_missing / hw_mismatch / quota / other
+    error_code: str | None = None
+    message: str
+    detail: dict[str, Any] = {}
+
+
+@router.post("/notify-admin", status_code=status.HTTP_201_CREATED)
+def notify_admin(
+    body: NotifyAdminRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """현재 로그인한 사용자(USER/ADMIN 무관)가 관리자에게 알림 송신."""
+    import json as _json
+    n = AdminNotification(
+        user_id=user.id,
+        user_email=user.email,
+        job_id=body.job_id,
+        kind=body.kind,
+        error_code=body.error_code,
+        message=body.message,
+        detail_json=_json.dumps(body.detail),
+        status="new",
+    )
+    db.add(n)
+    db.commit()
+    log.info(
+        "admin_notification_created",
+        extra={"user_id": user.id, "extra": {"kind": body.kind, "code": body.error_code}},
+    )
+    return {"id": n.id, "status": "new"}
+
+
+# ─────────────────────────────────────────
+# 일괄 삭제 — /{job_id} 정적 경로보다 먼저 등록
+# ─────────────────────────────────────────
+
+
+class BulkDeleteRequest(BaseModel):
+    """종료된 잡 일괄 삭제. states 미지정 시 FAILED 만."""
+    states: list[str] = ["FAILED"]
+
+
+@router.post("/bulk-delete")
+def bulk_delete_jobs(
+    body: BulkDeleteRequest,
+    user: User = Depends(get_current_user),
+) -> dict:
+    """본인 잡 중 지정 상태 일괄 삭제 (ADMIN은 전체)."""
+    from wfp_worker.runtime import _job_events, save_state
+    target_states: set[str] = set()
+    for s in body.states:
+        try:
+            target_states.add(JobState(s).value)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid state: {s}") from None
+    # 종료 상태만 허용
+    allowed_terminal = {JobState.DONE.value, JobState.FAILED.value, JobState.CANCELLED.value}
+    if not target_states.issubset(allowed_terminal):
+        raise HTTPException(
+            status_code=400,
+            detail=f"bulk-delete는 종료 상태만 허용: {sorted(allowed_terminal)}",
+        )
+    is_admin = user.role.value == "ADMIN"
+    to_delete = [
+        jid for jid, spec in _jobs.items()
+        if spec.state.value in target_states and (is_admin or spec.user_id == user.id)
+    ]
+    for jid in to_delete:
+        _jobs.pop(jid, None)
+        _ws_clients.pop(jid, None)
+        _job_events.pop(jid, None)
+    if to_delete:
+        save_state()
+    log.info("bulk_delete_jobs",
+             extra={"user_id": user.id, "extra": {"count": len(to_delete), "states": list(target_states)}})
+    return {"deleted": len(to_delete), "job_ids": to_delete}
+
+
 @router.get("", response_model=list[JobListItem])
 def list_jobs(
     user: User = Depends(get_current_user),
@@ -172,14 +260,25 @@ def get_job(
 
 
 @router.delete("/{job_id}")
-def cancel_job(
+def delete_or_cancel_job(
     job_id: str,
     user: User = Depends(get_current_user),
 ) -> dict:
-    """잡 취소 (소유자 또는 ADMIN)."""
+    """진행 중 잡 → CANCELLED, 종료된 잡(FAILED/DONE/CANCELLED) → 영구 삭제.
+
+    소유자 또는 ADMIN.
+    """
+    from wfp_worker.runtime import _job_events, save_state
     spec = _get_owned_or_admin(job_id, user)
     if spec.state in (JobState.DONE, JobState.FAILED, JobState.CANCELLED):
-        raise HTTPException(status_code=409, detail=f"Job already {spec.state.value}")
+        # 영구 삭제 — in-memory + persistence + WS clients + events 버퍼
+        _jobs.pop(job_id, None)
+        _ws_clients.pop(job_id, None)
+        _job_events.pop(job_id, None)
+        save_state()
+        log.info("job_deleted", extra={"user_id": user.id, "job_id": job_id})
+        return {"job_id": job_id, "state": "DELETED"}
+    # 진행 중 → 취소
     spec.state = JobState.CANCELLED
     return {"job_id": job_id, "state": "CANCELLED"}
 
@@ -205,11 +304,114 @@ def download_artifact(
     if not path.exists():
         raise HTTPException(status_code=404, detail="Artifact file missing on disk")
 
-    # 디렉토리(merged 등)는 클라이언트가 zip을 받도록 안내
+    # 디렉토리 (adapter/merged 등) — 즉석에서 zip 생성 후 전송
     if path.is_dir():
-        raise HTTPException(status_code=400, detail="Use kind=zip for directory artifacts")
+        import shutil
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        tmp.close()
+        # shutil.make_archive는 .zip 확장자 자동 추가 → base_name에서 제거
+        base = tmp.name[:-4] if tmp.name.endswith(".zip") else tmp.name
+        shutil.make_archive(base, "zip", root_dir=str(path))
+        zip_path = f"{base}.zip"
+        return FileResponse(
+            path=zip_path,
+            filename=f"{path.name}.zip",
+            media_type="application/zip",
+            background=None,  # 응답 후 tmp 파일 정리는 OS에 위임 (작은 수)
+        )
 
-    return FileResponse(path=str(path), filename=path.name, media_type="application/octet-stream")
+    # 단일 파일 — Content-Type 확장자 기반
+    media_map = {
+        ".md": "text/markdown",
+        ".json": "application/json",
+        ".gguf": "application/octet-stream",
+        ".safetensors": "application/octet-stream",
+        ".bin": "application/octet-stream",
+        ".zip": "application/zip",
+    }
+    media = media_map.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(path=str(path), filename=path.name, media_type=media)
+
+
+class HFUploadRequest(BaseModel):
+    """파인튜닝 모델을 HuggingFace Hub에 푸시."""
+    repo_id: str        # "username/repo-name"
+    artifact_kind: str = "adapter"   # adapter / merged
+    private: bool = True
+    hf_token: str = ""  # 비어있으면 user.hf_token_encrypted 사용
+
+
+@router.post("/{job_id}/upload-hf")
+def upload_to_hf(
+    job_id: str,
+    body: HFUploadRequest,
+    user: User = Depends(get_current_user),
+) -> dict:
+    """잡 완료된 모델을 HF Hub로 업로드.
+
+    토큰 우선순위: body.hf_token > user.hf_token_encrypted (settings에서 저장).
+    """
+    spec = _get_owned_or_admin(job_id, user)
+    if spec.state != JobState.DONE:
+        raise HTTPException(status_code=409, detail=f"Job not DONE (current: {spec.state.value})")
+
+    try:
+        target_kind = ArtifactKind(body.artifact_kind)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid artifact_kind: {body.artifact_kind}") from None
+
+    artifact = next((a for a in spec.artifacts if a.kind == target_kind), None)
+    if not artifact:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Artifact '{body.artifact_kind}' 없음. adapter/merged 등 디렉토리 형식만 업로드 가능.",
+        )
+
+    artifact_path = Path(artifact.uri)
+    if not artifact_path.exists() or not artifact_path.is_dir():
+        raise HTTPException(status_code=400, detail="업로드는 디렉토리 형식만 지원 (adapter/merged).")
+
+    # 토큰 결정 — hf_token_encrypted는 현재 평문 저장 (users.py TODO: encrypt)
+    token = body.hf_token.strip()
+    if not token and user.hf_token_encrypted:
+        token = user.hf_token_encrypted
+    if not token:
+        raise HTTPException(
+            status_code=400,
+            detail="HF 토큰 없음. 설정 페이지에서 토큰 저장 또는 body.hf_token 명시.",
+        )
+
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="huggingface_hub 미설치. 워커 venv: uv pip install -U huggingface_hub",
+        ) from None
+
+    try:
+        api = HfApi(token=token)
+        api.create_repo(repo_id=body.repo_id, repo_type="model", private=body.private, exist_ok=True)
+        api.upload_folder(
+            folder_path=str(artifact_path),
+            repo_id=body.repo_id,
+            repo_type="model",
+            commit_message=f"WFP fine-tune job {job_id[:8]} ({body.artifact_kind})",
+        )
+    except Exception as e:
+        log.exception("HF upload failed", extra={"user_id": user.id, "job_id": job_id})
+        raise HTTPException(status_code=502, detail=f"HF 업로드 실패: {e}") from e
+
+    log.info("hf_upload_success",
+             extra={"user_id": user.id, "job_id": job_id,
+                    "extra": {"repo": body.repo_id, "kind": body.artifact_kind}})
+    return {
+        "status": "ok",
+        "repo_id": body.repo_id,
+        "repo_url": f"https://huggingface.co/{body.repo_id}",
+        "private": body.private,
+    }
 
 
 # ─────────────────────────────────────────
@@ -252,3 +454,10 @@ def _to_detail(spec: JobSpec) -> JobDetail:
         train_override=spec.train_override,
         events=get_job_events(str(spec.job_id)),
     )
+
+
+# ─────────────────────────────────────────
+# 사용자 → 관리자 알림 (PRD §10.5)
+# ─────────────────────────────────────────
+
+

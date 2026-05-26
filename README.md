@@ -163,6 +163,9 @@ Docker for Mac은 Linux VM에서 동작 → MPS 미접근. Apple Silicon GPU/MPS
 make dev-worker             # uvicorn --reload (핫리로드)
 make prod-worker            # uvicorn workers=1
 
+# 가장 가벼운 — Docker 없이 SQLite + 호스트 PM2
+make docker-local-via-host  # postgres/redis/minio 미사용. Docker 데몬 불필요.
+
 # 인프라(docker) + worker/web(호스트 PM2 관리, 자동 재시작) — dev/prod 대칭
 make docker-dev-via-host    # = docker-infra + dev-env-check + PM2 start wfp-worker-dev/wfp-web-dev
 make docker-prod-via-host   # = docker-infra + env-check + pnpm build + PM2 start wfp-worker-prod/wfp-web-prod
@@ -176,7 +179,7 @@ make host-down              # pm2 delete all + pm2 kill + 포트 8000 좀비 정
 
 via-host는 `Finetuning-Pipeline-ops/scripts/ecosystem.config.cjs` 사용 — PM2 ecosystem에 worker dev/prod 각각 정의. 자동 재시작, 중앙 로그(`.host-logs/`), bash 래퍼로 `.env` 자동 로드.
 
-**dev/prod 대칭**: HW probe (nvidia-smi fallback) / HW 규칙 자동 탐색 / WFP-0203 강제 진행 / 잡 spec 전체 prefill — 모두 dev/prod 동일 코드.
+**local/dev/prod 대칭**: HW probe (nvidia-smi fallback) / HW 규칙 자동 탐색 / WFP-0203 강제 진행 / 잡 spec 전체 prefill — 모두 3 모드 동일 코드. local은 SQLite + Docker 불필요, dev/prod는 PostgreSQL + 인프라 컨테이너.
 
 `make bootstrap`이 uv + pnpm(corepack) + pm2 자동 설치.
 
