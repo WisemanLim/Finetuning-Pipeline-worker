@@ -76,22 +76,32 @@ def _probe_nvidia_via_smi() -> list[GPUInfo]:
         log.debug("nvidia-smi 호출 실패", extra={"extra": {"err": str(e)}})
         return []
 
+    def _safe_float(s: str) -> float:
+        """nvidia-smi는 unified memory / 일부 SKU에서 'Not Supported' / '[N/A]' 반환."""
+        s = s.strip()
+        if not s or s.startswith("[") or s.lower().startswith("not "):
+            return 0.0
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
     gpus: list[GPUInfo] = []
     for line in out.splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 3:
+        if len(parts) < 2:
             continue
         try:
             idx = int(parts[0])
             name = parts[1]
-            vram_mib = float(parts[2])
-            temp = float(parts[3]) if len(parts) > 3 and parts[3] not in ("", "[N/A]") else 0.0
-            util = float(parts[4]) if len(parts) > 4 and parts[4] not in ("", "[N/A]") else 0.0
-        except ValueError:
+        except (ValueError, IndexError):
             continue
+        vram_mib = _safe_float(parts[2]) if len(parts) > 2 else 0.0
+        temp = _safe_float(parts[3]) if len(parts) > 3 else 0.0
+        util = _safe_float(parts[4]) if len(parts) > 4 else 0.0
         gpus.append(GPUInfo(
             index=idx, name=name, vendor="nvidia",
-            vram_gb=round(vram_mib / 1024, 2),
+            vram_gb=round(vram_mib / 1024, 2),  # 0.0이면 unified memory (RAM 공유)
             compute_capability="",  # nvidia-smi에 표준 컬럼 없음
             utilization_pct=util,
             temperature_c=temp,
