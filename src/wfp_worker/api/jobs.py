@@ -84,6 +84,8 @@ class JobDetail(JobListItem):
     data_source_path: str = ""
     keywords: list[str] = []
     train_override: dict[str, Any] = {}
+    # 과거 이벤트 (WS 연결 안 된 상태에서 진행 로그 확인용)
+    events: list[str] = []
 
 
 # ─────────────────────────────────────────
@@ -225,6 +227,7 @@ def _get_owned_or_admin(job_id: str, user: User) -> JobSpec:
 
 
 def _to_detail(spec: JobSpec) -> JobDetail:
+    from wfp_worker.runtime import get_job_events
     return JobDetail(
         job_id=str(spec.job_id),
         state=spec.state.value,
@@ -247,4 +250,5 @@ def _to_detail(spec: JobSpec) -> JobDetail:
         data_source_path=spec.data_source_path,  # 원본 사용자 입력 (dataset_path는 정제 결과)
         keywords=spec.keywords,
         train_override=spec.train_override,
+        events=get_job_events(str(spec.job_id)),
     )
