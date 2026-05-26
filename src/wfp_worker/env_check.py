@@ -130,14 +130,36 @@ def _check_imports(packages: dict[str, str]) -> tuple[list[str], list[str]]:
     return installed, missing
 
 
-def _make_install_cmd(profile: str) -> str:
-    """현재 프로젝트 디렉토리에서 실행할 설치 명령 생성."""
+def _make_install_cmd_dyn(profile: str, torch_index: str | None) -> str:
+    """프로필 + 동적으로 결정된 torch_index로 설치 명령 생성."""
     p = PROFILES[profile]
     parts = ["uv", "pip", "install", f"'.[{p['extras']}]'"]
-    if p.get("torch_index"):
-        parts.extend(["--extra-index-url", p["torch_index"]])
+    if torch_index:
+        parts.extend(["--extra-index-url", torch_index])
         parts.extend(["--index-strategy", "unsafe-best-match"])
+        # nightly 인덱스면 --prerelease=allow 필요
+        if "nightly" in torch_index:
+            parts.append("--prerelease=allow")
     return " ".join(parts)
+
+
+def _make_install_cmd(profile: str) -> str:
+    """legacy — 정적 profile torch_index 사용."""
+    return _make_install_cmd_dyn(profile, PROFILES[profile].get("torch_index"))
+
+
+def _resolve_torch_index(profile: str, caps) -> str | None:
+    """PyTorch wheel index 동적 결정.
+
+    aarch64 + NVIDIA (Grace/Blackwell/Jetson) → 표준 cu121은 x86_64 only → nightly cu126으로.
+    그 외 NVIDIA → 표준 cu121.
+    """
+    if profile != "nvidia":
+        return PROFILES[profile]["torch_index"]
+    import platform
+    if platform.machine().lower() in ("aarch64", "arm64"):
+        return "https://download.pytorch.org/whl/nightly/cu126"
+    return PROFILES["nvidia"]["torch_index"]
 
 
 def diagnose() -> EnvDiagnosis:
@@ -147,10 +169,12 @@ def diagnose() -> EnvDiagnosis:
 
     caps = HWProber().probe()
     profile = _detect_profile(caps)
-    cfg = PROFILES[profile]
+    cfg = dict(PROFILES[profile])
+    # aarch64 NVIDIA → nightly cu126 동적 교체
+    cfg["torch_index"] = _resolve_torch_index(profile, caps)
 
     installed, missing = _check_imports(cfg["packages"])
-    install_cmd = _make_install_cmd(profile)
+    install_cmd = _make_install_cmd_dyn(profile, cfg["torch_index"])
 
     # GPU 이름
     gpu_name = caps.gpus[0].name if caps.gpus else "—"
@@ -204,6 +228,10 @@ def install_missing(diagnosis: EnvDiagnosis | None = None) -> dict:
         return {"status": "already_installed", "missing": []}
 
     cfg = PROFILES[diag.profile]
+    # 동적 torch index (aarch64 + nvidia → nightly cu126)
+    from wfp_worker.stage2_hw_probe import HWProber
+    caps = HWProber().probe()
+    torch_index = _resolve_torch_index(diag.profile, caps)
 
     # uv 탐색 — PATH → 현재 Python venv bin → 없으면 pip fallback
     uv_bin = (
@@ -213,16 +241,20 @@ def install_missing(diagnosis: EnvDiagnosis | None = None) -> dict:
 
     if uv_bin:
         cmd: list[str] = [uv_bin, "pip", "install", f".[{cfg['extras']}]"]
-        if cfg.get("torch_index"):
+        if torch_index:
             cmd.extend([
-                "--extra-index-url", cfg["torch_index"],
+                "--extra-index-url", torch_index,
                 "--index-strategy", "unsafe-best-match",
             ])
+            if "nightly" in torch_index:
+                cmd.append("--prerelease=allow")
     else:
         # pip fallback (--index-strategy 미지원)
         cmd = [sys.executable, "-m", "pip", "install", f".[{cfg['extras']}]"]
-        if cfg.get("torch_index"):
-            cmd.extend(["--extra-index-url", cfg["torch_index"]])
+        if torch_index:
+            cmd.extend(["--extra-index-url", torch_index])
+            if "nightly" in torch_index:
+                cmd.append("--pre")
 
     # 프로젝트 루트 자동 감지: env_check.py → wfp_worker/ → src/ → ml-worker/
     _auto_cwd = str(Path(__file__).resolve().parent.parent.parent)
