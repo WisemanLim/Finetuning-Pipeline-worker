@@ -719,6 +719,18 @@ Finetuning-Pipeline-worker/
 
 - `last_event_at: str | None` 추가. 클라이언트가 5분 무이벤트로 멈춤 감지.
 
+### tqdm → WebSocket 브리지 (NEW)
+
+- [common/tqdm_bridge.py](src/wfp_worker/common/tqdm_bridge.py) — `tqdm.std.tqdm` / `tqdm.auto.tqdm` / `tqdm.tqdm` 을 `WfpTqdm` 서브클래스로 monkey-patch.
+- `update` / `refresh` / `close` 시 500ms throttle 로 `step` / `total_steps` / `tqdm_desc` / `stage_progress` WS 이벤트 발행.
+- 잡 컨텍스트 전달: `contextvars.ContextVar` 사용. `asyncio.to_thread` 는 Python 3.9+ 부터 context 자동 propagation → 워커 스레드에서도 emit 가능.
+- 설치 시점: `server.py` 최상단 (dotenv 직후, transformers/datasets/huggingface_hub import 전).
+- 효과: `from_pretrained` 모델 로드 / `datasets.load_dataset` / `dataset.map` / 토크나이저 등 외부 라이브러리 tqdm 이 전부 잡 상세 페이지의 진행 라인에 표시.
+- 부작용 방지:
+  - emit cb 미설정 + active job_id 미설정 → no-op.
+  - 이중 install 방지 (`_installed` 플래그).
+  - emit 실패는 silent (학습/평가에 영향 없음).
+
 ### 인증/권한 (변경 없음, 확인용 정리)
 
 - `get_current_user` — 토큰 없음 → 401. 무효/만료 → 401.

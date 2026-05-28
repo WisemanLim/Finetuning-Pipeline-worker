@@ -22,6 +22,11 @@ from __future__ import annotations
 from dotenv import load_dotenv
 load_dotenv()
 
+# tqdm → WS 브리지 설치. transformers/datasets/huggingface_hub 등 외부 라이브러리
+# import 이전에 호출해야 그들이 보는 tqdm 클래스가 패치됨.
+from wfp_worker.common import tqdm_bridge as _tqdm_bridge  # noqa: E402
+_tqdm_bridge.install()
+
 import asyncio
 import json
 from contextlib import asynccontextmanager

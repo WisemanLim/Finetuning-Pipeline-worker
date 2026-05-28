@@ -211,6 +211,15 @@ def _make_progress_cb(job_id: str):
         except Exception:
             # 루프가 이미 닫혔거나 디스패치 실패 — 학습은 계속
             pass
+
+    # tqdm_bridge 가 사용할 동일 emit 콜백 등록 (idempotent).
+    # transformers / datasets / huggingface_hub 의 tqdm 진행도가 WS 로 흐름.
+    try:
+        from wfp_worker.common import tqdm_bridge
+        tqdm_bridge.configure(cb)
+    except Exception:
+        pass
+
     return cb
 
 
@@ -381,13 +390,23 @@ async def _run_pipeline(
     if start_stage <= 2:
         spec.started_at = datetime.now(timezone.utc)
 
+    # tqdm_bridge: 첫 호출 시 emit cb 등록 + 매 stage 마다 context 설정.
+    # transformers/datasets 의 stdout tqdm 도 WS 이벤트로 흐르게 됨.
+    from wfp_worker.common import tqdm_bridge
+    _bridge_cb = _make_progress_cb(job_id)  # configure 부수 효과
+    tqdm_bridge.configure(_bridge_cb)
+
     try:
         for stage_num in range(start_stage, 10):
             if stage_num not in _STAGE_RUNNERS:
                 continue
             spec.current_stage = stage_num
             runner = _STAGE_RUNNERS[stage_num]
-            await runner(spec, req, emit)
+            ctx_tokens = tqdm_bridge.set_job_context(job_id, stage_num)
+            try:
+                await runner(spec, req, emit)
+            finally:
+                tqdm_bridge.reset_job_context(ctx_tokens)
 
         spec.state = JobState.DONE
         spec.finished_at = datetime.now(timezone.utc)
