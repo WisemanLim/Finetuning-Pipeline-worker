@@ -259,6 +259,9 @@ class JobSpec(BaseModel):
     model_hf_repo: str = ""         # HuggingFace repo id
     model_revision: str = "main"
     model_local_path: str = ""
+    # 잡 생성 시 user.hf_token_encrypted 복사본 — gated 모델 다운로드용.
+    # env / cache 토큰보다 우선. 로그 노출 회피 위해 dump 시 마스킹 권장.
+    hf_token: str = ""
 
     # Stage 5 — 데이터 결과
     data_source_mode: DataSourceMode = DataSourceMode.UPLOAD

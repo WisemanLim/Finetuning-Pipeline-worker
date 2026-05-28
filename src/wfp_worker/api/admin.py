@@ -664,7 +664,7 @@ def run_reaper(
                 disk_freed += size_mb
                 detail.append(f"checkpoint {jid} purged ({size_mb:.1f}MB)")
 
-    save_state()
+    save_state(force=True)
     _audit(db, actor, "reaper_run", detail=f"failed={jobs_failed} purged={checkpoints_purged}")
     return ReaperResult(
         jobs_failed=jobs_failed,
@@ -1123,6 +1123,196 @@ def auto_refresh_catalog(
     db.commit()
     _audit(db, actor, "catalog_auto_refresh", detail=str(summary.to_dict()))
     return AutoRefreshResult(**summary.to_dict())
+
+
+# ─────────────────────────────────────────
+# HF gated repo 사전 점검 + 관리자 트리거 모델 다운로드
+# ─────────────────────────────────────────
+
+
+class HfAccessCheckResult(BaseModel):
+    repo: str
+    status: str                # "ok" | "gated" | "no_token" | "not_found" | "error"
+    detail: str = ""
+    instructions: list[str] = []
+
+
+def _load_admin_hf_token() -> str | None:
+    """관리자 호스트의 HF 토큰 — env HF_TOKEN / HUGGING_FACE_HUB_TOKEN /
+    ~/.cache/huggingface/token 순.
+    """
+    import os
+    from pathlib import Path
+    token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
+    if token:
+        return token
+    path = Path.home() / ".cache" / "huggingface" / "token"
+    if path.exists():
+        return path.read_text().strip() or None
+    return None
+
+
+def _gated_instructions(repo: str, job_id: str | None = None) -> list[str]:
+    return [
+        f"https://huggingface.co/{repo} 방문 (관리자 HF 계정 로그인)",
+        "Access repository 버튼 클릭",
+        "라이선스 동의 form 제출",
+        "승인 대기 (Gemma 등은 즉시 / 일부 모델은 수동 review)",
+        (f"승인 후 POST /admin/jobs/{job_id}/resume-download 호출"
+         if job_id else "승인 후 POST /admin/jobs/{job_id}/resume-download 또는 "
+                        "POST /admin/hf/download 호출"),
+    ]
+
+
+@router.get("/hf/check-access", response_model=HfAccessCheckResult)
+def hf_check_access(
+    repo: str,
+    _: User = Depends(get_current_admin),
+) -> HfAccessCheckResult:
+    """관리자 HF 토큰으로 repo 접근 가능 여부 사전 점검.
+
+    HfApi.model_info 호출 시 status:
+      - 200 → ok
+      - 401 → no_token (토큰 자체 무효)
+      - 403 → gated (라이선스 동의 + 승인 필요)
+      - 404 → not_found
+    """
+    repo = (repo or "").strip()
+    if not repo:
+        raise HTTPException(status_code=400, detail="repo 파라미터 필요")
+    token = _load_admin_hf_token()
+    if not token:
+        return HfAccessCheckResult(
+            repo=repo, status="no_token",
+            detail="관리자 호스트의 HF_TOKEN 환경변수 또는 ~/.cache/huggingface/token 미설정.",
+        )
+    try:
+        from huggingface_hub import HfApi
+        from huggingface_hub.utils import HfHubHTTPError
+    except ImportError as e:
+        raise HTTPException(status_code=503, detail="huggingface_hub 미설치") from e
+    try:
+        HfApi(token=token).model_info(repo_id=repo)
+    except HfHubHTTPError as e:
+        sc = getattr(getattr(e, "response", None), "status_code", None)
+        if sc == 403:
+            return HfAccessCheckResult(
+                repo=repo, status="gated",
+                detail="403 — gated repo. 라이선스 동의 + 승인 필요.",
+                instructions=_gated_instructions(repo),
+            )
+        if sc == 401:
+            return HfAccessCheckResult(
+                repo=repo, status="no_token",
+                detail="401 — 토큰 무효. 관리자 HF_TOKEN 재발급 필요.",
+            )
+        if sc == 404:
+            return HfAccessCheckResult(
+                repo=repo, status="not_found",
+                detail=f"404 — repo {repo} 존재하지 않거나 비공개.",
+            )
+        return HfAccessCheckResult(repo=repo, status="error", detail=str(e))
+    except Exception as e:
+        return HfAccessCheckResult(repo=repo, status="error", detail=str(e))
+    return HfAccessCheckResult(repo=repo, status="ok", detail="접근 가능 — 다운로드 가능 상태.")
+
+
+class ResumeDownloadResult(BaseModel):
+    job_id: str
+    repo: str
+    pre_check: HfAccessCheckResult
+    download_started: bool
+    revived_from_state: str | None = None
+    new_start_stage: int | None = None
+    detail: str = ""
+
+
+@router.post("/jobs/{job_id}/resume-download", response_model=ResumeDownloadResult)
+async def admin_resume_download(
+    job_id: str,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> ResumeDownloadResult:
+    """gated repo 차단으로 멈춘 잡의 모델을 관리자 토큰으로 다운로드 + 잡 부활.
+
+    흐름:
+      1. 사전 점검 (hf_check_access 동일 로직) — status != ok 면 다운로드 안하고 안내만 반환.
+      2. 다운로드 — ModelDownloader 가 spec.hf_token 비어있으면 env HF_TOKEN 자동 fallback.
+         progress 콜백으로 잡 WS 에 진행도 발행.
+      3. 잡 부활 — Stage 5 부터 재실행. 관련 AdminNotification 들 status=resolved.
+
+    Pre-condition: 사용자가 huggingface.co/<repo> 에서 라이선스 동의 + 승인 완료 상태.
+    승인 안된 상태에서 호출하면 pre_check.status=gated 로 안내 반환 후 종료.
+    """
+    from wfp_worker.runtime import _jobs, revive_job_from_stage
+    from wfp_worker.stage4_model import ModelDownloader
+
+    spec = _jobs.get(job_id)
+    if not spec:
+        raise HTTPException(status_code=404, detail="Job not found")
+    repo = spec.model_hf_repo
+    if not repo:
+        raise HTTPException(status_code=400, detail="잡에 model_hf_repo 설정 없음")
+
+    # 1. 사전 점검
+    pre = hf_check_access(repo=repo, _=actor)  # type: ignore[arg-type]
+    if pre.status != "ok":
+        _audit(db, actor, "admin_resume_download_blocked",
+               target=job_id, detail=f"repo={repo} status={pre.status}")
+        return ResumeDownloadResult(
+            job_id=job_id, repo=repo, pre_check=pre,
+            download_started=False,
+            detail=f"사전 점검 실패 ({pre.status}) — 라이선스 동의/승인 완료 후 재호출.",
+        )
+
+    # 2. 다운로드 — 캐시 hit 면 거의 즉시, miss 면 동기 다운로드.
+    #    progress 발행은 다음 단계의 revive (_run_pipeline) 가 Stage 5 부터 재실행하며
+    #    WS 이벤트로 흘려보낸다. 다운로드 자체는 admin endpoint 응답 흐름에서 동기 수행.
+    try:
+        # admin token 강제: spec.hf_token 우선이라 비워두면 _load_token 이 env 폴백.
+        spec.hf_token = ""
+        # 캐시 hit 면 즉시 종료, miss 면 동기 다운로드.
+        ModelDownloader().download(spec)
+    except Exception as e:
+        _audit(db, actor, "admin_resume_download_failed",
+               target=job_id, detail=f"repo={repo} err={e}")
+        raise HTTPException(status_code=502, detail=f"다운로드 실패: {e}") from e
+
+    # 3. 관련 AdminNotification resolve
+    notifs = (
+        db.query(AdminNotification)
+        .filter(
+            AdminNotification.job_id == job_id,
+            AdminNotification.kind == "hf_gated",
+            AdminNotification.status != "resolved",
+        )
+        .all()
+    )
+    for n in notifs:
+        n.status = "resolved"
+        n.resolved_at = datetime.now(timezone.utc)
+        n.resolved_by = actor.id
+    db.commit()
+
+    # 4. 잡 부활 — Stage 5 부터 (모델 다운로드 완료, Stage 4 재실행 불필요).
+    from wfp_worker.common.errors import WFPError
+    try:
+        revived = await revive_job_from_stage(job_id, 5, reason=f"admin:{actor.id}")
+    except WFPError as e:
+        _audit(db, actor, "admin_resume_download_revive_failed",
+               target=job_id, detail=e.to_dict()["title"])
+        raise HTTPException(status_code=409, detail=e.to_dict()) from e
+
+    _audit(db, actor, "admin_resume_download",
+           target=job_id, detail=f"repo={repo} notifs_resolved={len(notifs)}")
+
+    return ResumeDownloadResult(
+        job_id=job_id, repo=repo, pre_check=pre,
+        download_started=True,
+        revived_from_state=revived.get("revived_from_state"),
+        new_start_stage=revived.get("new_start_stage"),
+        detail=f"다운로드 완료 + 잡 부활 (Stage {revived.get('new_start_stage')} 부터).",
+    )
 
 
 # ─────────────────────────────────────────

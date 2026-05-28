@@ -96,21 +96,32 @@ def install() -> bool:
 
         def update(self, n: float = 1) -> Any:
             result = super().update(n)
-            self._wfp_maybe_emit()
+            try:
+                self._wfp_maybe_emit()
+            except Exception:
+                pass
             return result
 
         def refresh(self, *args: Any, **kwargs: Any) -> Any:
             result = super().refresh(*args, **kwargs)
-            self._wfp_maybe_emit()
+            try:
+                self._wfp_maybe_emit()
+            except Exception:
+                pass
             return result
 
         def close(self) -> Any:
-            self._wfp_emit(force=True)
+            try:
+                self._wfp_emit(force=True)
+            except Exception:
+                pass
             return super().close()
 
         def _wfp_maybe_emit(self) -> None:
+            # disable 인스턴스는 _wfp_last_emit_at 도 없을 수 있음 → getattr 폴백.
+            last = getattr(self, "_wfp_last_emit_at", 0.0)
             now = time.monotonic()
-            if now - self._wfp_last_emit_at < self._wfp_emit_interval:
+            if now - last < self._wfp_emit_interval:
                 return
             self._wfp_last_emit_at = now
             self._wfp_emit()
@@ -121,11 +132,17 @@ def install() -> bool:
             job_id = _active_job_id.get()
             if not job_id:
                 return
-            total = self.total or 0
+            # tqdm(disable=True) 인스턴스는 fast-path __init__ 으로 일부 속성
+            # (desc, dynamic_ncols 등) 이 설정되지 않음 → 직접 self.desc 접근 시
+            # AttributeError: 'tqdm' object has no attribute 'desc'.
+            # getattr 로 안전하게 폴백.
+            if getattr(self, "disable", False):
+                return
+            total = getattr(self, "total", None) or 0
             if total <= 0:
                 return
-            n = self.n or 0
-            desc = self.desc or "progress"
+            n = getattr(self, "n", 0) or 0
+            desc = getattr(self, "desc", None) or "progress"
             stage = _active_stage.get()
             try:
                 _emitter(

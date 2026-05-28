@@ -119,13 +119,25 @@ def _detect_profile(caps: HWCaps) -> str:
 
 
 def _check_imports(packages: dict[str, str]) -> tuple[list[str], list[str]]:
-    """import 가능한 패키지 / 누락 패키지 분리."""
+    """import 가능한 패키지 / 누락 패키지 분리.
+
+    `__import__` 는 모듈을 실제 로드하여 module-level 부수효과 (예: bitsandbytes 의
+    CUDA 초기화) 가 발생. non-CUDA 호스트에서 RuntimeError/AttributeError 가
+    ImportError 가 아닌 형태로 새어나가 진단 자체가 크래시. find_spec 으로 변경하여
+    설치 여부만 메타데이터로 확인.
+    """
+    import importlib.util
+
     installed, missing = [], []
     for import_name, pip_name in packages.items():
+        mod_name = import_name.replace("-", "_")
         try:
-            __import__(import_name.replace("-", "_"))
+            spec = importlib.util.find_spec(mod_name)
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None:
             installed.append(pip_name)
-        except ImportError:
+        else:
             missing.append(pip_name)
     return installed, missing
 

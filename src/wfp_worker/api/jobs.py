@@ -132,6 +132,11 @@ async def create_job(
     spec.data_source_path = req.data_source_path or ""
     spec.keywords = req.keywords or []
     spec.train_override = req.train_override or {}
+    # DEPRECATED 2026-05: 사용자 HF 토큰 스냅샷 비활성. gated repo 다운로드는
+    # AdminNotification(kind="hf_gated") → 관리자가 /admin/jobs/{id}/resume-download
+    # 로 admin HF_TOKEN 사용해 진행. 사용자 평문 토큰 채널 차단.
+    # if user.hf_token_encrypted:
+    #     spec.hf_token = user.hf_token_encrypted
 
     job_id = str(spec.job_id)
     _jobs[job_id] = spec
@@ -231,7 +236,7 @@ def bulk_delete_jobs(
         _ws_clients.pop(jid, None)
         _job_events.pop(jid, None)
     if to_delete:
-        save_state()
+        save_state(force=True)
     log.info("bulk_delete_jobs",
              extra={"user_id": user.id, "extra": {"count": len(to_delete), "states": list(target_states)}})
     return {"deleted": len(to_delete), "job_ids": to_delete}
@@ -290,7 +295,7 @@ def delete_or_cancel_job(
         _jobs.pop(job_id, None)
         _ws_clients.pop(job_id, None)
         _job_events.pop(job_id, None)
-        save_state()
+        save_state(force=True)
         log.info("job_deleted", extra={"user_id": user.id, "job_id": job_id})
         return {"job_id": job_id, "state": "DELETED"}
     # 진행 중 → 취소

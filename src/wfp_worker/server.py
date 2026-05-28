@@ -63,8 +63,8 @@ async def _lifespan(app: FastAPI):
     from wfp_worker.runtime import load_state, save_state
     load_state()
     yield
-    # 종료 직전 한번 더 저장 (graceful shutdown)
-    save_state()
+    # 종료 직전 한번 더 저장 (graceful shutdown) — throttle 우회
+    save_state(force=True)
     log.info("WFP Worker 종료")
 
 

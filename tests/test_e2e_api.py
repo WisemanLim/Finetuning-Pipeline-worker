@@ -176,12 +176,16 @@ def test_e11_patch_profile(client: TestClient) -> None:
     assert r.json()["name"] == "Wiseman"
 
 
-def test_e12_hf_token_save_delete(client: TestClient) -> None:
+def test_e12_hf_token_routes_deprecated(client: TestClient) -> None:
+    """사용자 HF 토큰 저장/삭제는 비활성 (2026-05). 라우트 미등록 → 404.
+
+    gated repo 다운로드는 AdminNotification → /admin/jobs/{id}/resume-download 흐름으로 대체.
+    """
     token = _signup(client, "hf@x.com")
     r = client.post("/users/me/hf-token", headers=_auth(token), json={"hf_token": "hf_xxxxxx12345"})
-    assert r.status_code == 204
+    assert r.status_code == 404
     r = client.delete("/users/me/hf-token", headers=_auth(token))
-    assert r.status_code == 204
+    assert r.status_code == 404
 
 
 # ─────────────────────────────────────────

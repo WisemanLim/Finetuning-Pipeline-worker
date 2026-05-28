@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +73,11 @@ _PERSIST_PATH = _PERSIST_DIR / "jobs_state.json"
 
 _BACKUP_KEEP = 5  # 최근 N개 회전 백업 유지
 
+# save_state throttle — _emit_ws 가 학습 중 초당 수십회 호출되어
+# 디스크 I/O 폭주를 일으키는 것 방지. force=True 로 우회 가능.
+_SAVE_MIN_INTERVAL = 2.0
+_last_save_at: float = 0.0
+
 
 def _rotate_backup() -> None:
     """덮어쓰기 전 jobs_state.json 회전 백업.
@@ -96,8 +102,18 @@ def _rotate_backup() -> None:
         log.debug("backup rotate 실패", extra={"extra": {"err": str(e)}})
 
 
-def save_state() -> None:
-    """잡 메타데이터 + 이벤트 buffer를 디스크에 atomic write + 회전 백업."""
+def save_state(force: bool = False) -> None:
+    """잡 메타데이터 + 이벤트 buffer를 디스크에 atomic write + 회전 백업.
+
+    Stage 7 학습 중 tqdm 진행도가 초당 수십회 _emit_ws 를 호출 → save_state 가
+    매번 호출되면 디스크 I/O 폭주. 마지막 쓰기로부터 _SAVE_MIN_INTERVAL 초 미만이면 skip.
+    `force=True` 로 jobs CRUD / shutdown / finalize 등 중요 시점은 강제 쓰기.
+    """
+    global _last_save_at
+    now = time.monotonic()
+    if not force and (now - _last_save_at) < _SAVE_MIN_INTERVAL:
+        return
+    _last_save_at = now
     try:
         _PERSIST_DIR.mkdir(parents=True, exist_ok=True)
         # 덮어쓰기 전 이전 버전 백업 (실수 삭제 복구용)
@@ -283,8 +299,94 @@ async def _stage_4_model(spec: JobSpec, req: dict[str, Any], emit: _EmitFn) -> N
     from wfp_worker.stage4_model import ModelDownloader, ModelPicker
     await asyncio.to_thread(ModelPicker().pick, spec, req.get("model_hf_repo") or None)
     await emit("Stage 4: 모델 다운로드 중", {"repo": spec.model_hf_repo, "stage": 4})
-    await asyncio.to_thread(ModelDownloader().download, spec)
+    # Stage 7/8 과 동일한 progress 콜백을 다운로더에 주입 → snapshot_download 의
+    # 파일 단위 집계 tqdm 이 WS 이벤트로 흐름.
+    dl_cb = _make_progress_cb(str(spec.job_id))
+    try:
+        await asyncio.to_thread(ModelDownloader(progress_cb=dl_cb).download, spec)
+    except WFPError as e:
+        # gated repo / 토큰 부재 → 관리자 알림 생성 + 잡 FAILED 마킹.
+        # 관리자는 /admin/jobs/{id}/resume-download 로 라이선스 사전 점검 후 재다운로드.
+        if e.code in (WFPErrorCode.LICENSE_NOT_ACCEPTED, WFPErrorCode.HF_TOKEN_MISSING):
+            _create_hf_gated_notification(spec, e)
+            await emit(
+                f"⚠ Stage 4: {e.message} — 관리자 알림 생성",
+                {"stage": 4, "code": e.code.value, "detail": e.detail,
+                 "repo": spec.model_hf_repo, "admin_action_required": True},
+            )
+        raise
     await emit("Stage 4 완료", {"model": spec.model_hf_repo, "stage": 4})
+
+
+def _create_hf_gated_notification(spec: JobSpec, err: "WFPError") -> None:
+    """HF gated/토큰 부재 시 AdminNotification 한 건 생성.
+
+    중복 방지: 동일 (job_id, kind=hf_gated, status=new) 이미 있으면 skip.
+    DB 세션 실패해도 잡 흐름은 깨지지 않도록 silent fallback.
+    """
+    try:
+        import json as _json
+
+        from wfp_worker.db import AdminNotification, User
+        from wfp_worker.db.session import SessionLocal  # type: ignore
+    except Exception:
+        return
+    db = None
+    try:
+        db = SessionLocal()
+        existing = (
+            db.query(AdminNotification)
+            .filter(
+                AdminNotification.job_id == str(spec.job_id),
+                AdminNotification.kind == "hf_gated",
+                AdminNotification.status == "new",
+            )
+            .first()
+        )
+        if existing:
+            return
+        # 사용자 이메일 lookup — 없어도 알림은 생성.
+        user_email = ""
+        if spec.user_id:
+            u = db.get(User, spec.user_id)
+            if u:
+                user_email = u.email
+        db.add(AdminNotification(
+            user_id=spec.user_id or "",
+            user_email=user_email,
+            job_id=str(spec.job_id),
+            kind="hf_gated",
+            error_code=err.code.value,
+            message=err.message,
+            detail_json=_json.dumps({
+                "repo": spec.model_hf_repo,
+                "stage": 4,
+                "instructions": [
+                    f"https://huggingface.co/{spec.model_hf_repo} 방문 (관리자 HF 계정 로그인)",
+                    "Access repository 버튼 클릭",
+                    "라이선스 동의 form 제출",
+                    "승인 대기 (Gemma 등은 즉시, 일부 모델은 수동 review)",
+                    f"승인 후 POST /admin/jobs/{spec.job_id}/resume-download 호출",
+                ],
+                "detail": err.detail,
+            }),
+            status="new",
+        ))
+        db.commit()
+        log.info(
+            "hf_gated_notification_created",
+            extra={"job_id": str(spec.job_id),
+                   "extra": {"repo": spec.model_hf_repo, "code": err.code.value}},
+        )
+    except Exception as ex:
+        log.warning("hf_gated_notification_failed",
+                    extra={"extra": {"err": str(ex), "job_id": str(spec.job_id)}})
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 async def _stage_5_data(spec: JobSpec, req: dict[str, Any], emit: _EmitFn) -> None:
@@ -551,6 +653,72 @@ async def advance_job(job_id: str, *, reason: str = "user") -> dict[str, Any]:
         return {"advanced_from": from_stage, "new_start_stage": next_stage, "restarted": True}
 
 
+async def revive_job_from_stage(
+    job_id: str, start_stage: int, *, reason: str = "admin"
+) -> dict[str, Any]:
+    """종료된 (FAILED) 잡을 부활 — 지정 stage 부터 재실행.
+
+    Stage 4 gated repo 차단으로 FAILED 된 잡을 관리자가 모델 다운로드 완료 후
+    Stage 5 부터 재개할 때 사용. DONE/CANCELLED 는 거부.
+
+    Parameters
+    ----------
+    start_stage:
+        재개 시작 stage (2~9). 보통 다운로드 후라면 5.
+    reason:
+        감사 로그 + WS 이벤트용 사유.
+
+    Returns
+    -------
+    {revived_from_state, new_start_stage}
+    """
+    async with _get_lock(job_id):
+        spec = _jobs.get(job_id)
+        if spec is None:
+            raise WFPError(WFPErrorCode.JOB_NOT_FOUND, f"job {job_id} 없음")
+        if spec.state in (JobState.DONE, JobState.CANCELLED):
+            raise WFPError(
+                WFPErrorCode.INVALID_STATE,
+                f"revive 불가 (state={spec.state.value}) — DONE/CANCELLED 잡은 부활 안됨",
+            )
+        if start_stage < 2 or start_stage > 9:
+            raise WFPError(
+                WFPErrorCode.INVALID_STATE,
+                f"start_stage 는 2~9 사이여야 함 (요청: {start_stage})",
+            )
+
+        # 기존 task 가 살아있으면 정리 (보통 FAILED 면 이미 종료됨).
+        await _cancel_running_task(job_id)
+
+        prev_state = spec.state.value
+        spec.state = JobState.RUNNING
+        spec.error_code = ""
+        spec.error_message = ""
+        spec.current_stage = start_stage - 1
+        spec.finished_at = None
+
+        await _emit_ws(
+            job_id,
+            f"잡 부활 — Stage {start_stage} 부터 재실행 ({reason})",
+            {"revive": True, "from_state": prev_state, "to_stage": start_stage,
+             "reason": reason},
+        )
+
+        req = _job_reqs.get(job_id) or {}
+        new_task = asyncio.create_task(
+            _run_pipeline(spec, req, start_stage=start_stage)
+        )
+        _job_tasks[job_id] = new_task
+
+        log.info(
+            "job_revived",
+            extra={"job_id": job_id,
+                   "extra": {"from_state": prev_state,
+                             "start_stage": start_stage, "reason": reason}},
+        )
+        return {"revived_from_state": prev_state, "new_start_stage": start_stage}
+
+
 async def finalize_job(job_id: str, *, reason: str = "user") -> dict[str, Any]:
     """
     학습(Stage 7) 산출물로 잡 조기 종료. 평가/패키징 스킵.
@@ -581,7 +749,7 @@ async def finalize_job(job_id: str, *, reason: str = "user") -> dict[str, Any]:
 
         spec.state = JobState.DONE
         spec.finished_at = datetime.now(timezone.utc)
-        save_state()
+        save_state(force=True)
 
         log.info(
             "job_finalized",
