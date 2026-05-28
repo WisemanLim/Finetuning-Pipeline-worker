@@ -65,7 +65,9 @@ class WFPErrorCode(str, Enum):
     ARTIFACT_UPLOAD_FAILED = "WFP-0902"
     MODEL_CARD_FAILED = "WFP-0903"
 
-    # 공통
+    # 공통 / 운영
+    JOB_NOT_FOUND = "WFP-9001"          # advance/finalize 대상 잡 없음
+    INVALID_STATE = "WFP-9002"          # 종료된 잡에 진행 시도 등 상태 위반
     UNKNOWN = "WFP-9999"
 
 

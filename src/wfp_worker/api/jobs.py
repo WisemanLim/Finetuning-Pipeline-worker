@@ -35,8 +35,16 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
 # 잡 인메모리 스토어 — server.py와 공유 (모듈 임포트 시 동일 인스턴스).
-from wfp_worker.runtime import _jobs, _run_pipeline, _ws_clients  # noqa: E402
-
+from wfp_worker.runtime import (  # noqa: E402
+    _job_reqs,
+    _job_tasks,
+    _jobs,
+    _run_pipeline,
+    _ws_clients,
+    advance_job,
+    finalize_job,
+    get_last_event_at,
+)
 
 # ─────────────────────────────────────────
 # Request / Response
@@ -86,6 +94,8 @@ class JobDetail(JobListItem):
     train_override: dict[str, Any] = {}
     # 과거 이벤트 (WS 연결 안 된 상태에서 진행 로그 확인용)
     events: list[str] = []
+    # 마지막 WS 이벤트 timestamp — 클라이언트가 "멈춤" 감지에 사용 (ISO8601)
+    last_event_at: str | None = None
 
 
 # ─────────────────────────────────────────
@@ -127,8 +137,13 @@ async def create_job(
     _jobs[job_id] = spec
     _ws_clients[job_id] = []
 
-    # async 라우터 안 → 현재 이벤트 루프에 태스크 등록
-    asyncio.create_task(_run_pipeline(spec, req.model_dump()))
+    # req 보존 — advance 시 stage 재실행에 필요
+    req_dict = req.model_dump()
+    _job_reqs[job_id] = req_dict
+
+    # async 라우터 안 → 현재 이벤트 루프에 태스크 등록 + 추적
+    task = asyncio.create_task(_run_pipeline(spec, req_dict))
+    _job_tasks[job_id] = task
     log.info("job_created", extra={"user_id": user.id, "job_id": job_id})
 
     return {"job_id": job_id, "state": spec.state.value}
@@ -283,6 +298,53 @@ def delete_or_cancel_job(
     return {"job_id": job_id, "state": "CANCELLED"}
 
 
+@router.post("/{job_id}/advance")
+async def advance_stuck_job(
+    job_id: str,
+    user: User = Depends(get_current_user),
+) -> dict:
+    """
+    멈춘 stage 강제 스킵 + 다음 stage 부터 재실행.
+
+    소유자 또는 ADMIN 호출 가능. 종료된 잡(DONE/FAILED/CANCELLED) 은 거부.
+    Stage 9 가 마지막 — 그 이상 advance 는 자동 DONE 마킹.
+
+    주의: 스킵된 stage 의 산출물은 누락되어 후속 stage 에서 에러 가능. 사용 전 confirm 권장.
+    """
+    spec = _get_owned_or_admin(job_id, user)
+    try:
+        result = await advance_job(job_id, reason=f"user:{user.id}")
+    except WFPError as e:
+        # JOB_NOT_FOUND / INVALID_STATE
+        raise HTTPException(status_code=409, detail=e.to_dict()) from e
+    log.info("job_advance_invoked",
+             extra={"user_id": user.id, "job_id": job_id, "extra": result})
+    _ = spec  # silence unused after _get_owned_or_admin auth gate
+    return result
+
+
+@router.post("/{job_id}/finalize")
+async def finalize_stuck_job(
+    job_id: str,
+    user: User = Depends(get_current_user),
+) -> dict:
+    """
+    잡 조기 종료 — 현재 stage 까지 산출물로 DONE 마킹. 평가/패키징 스킵.
+
+    체크포인트가 있으면 학습 결과만으로 사용/다운로드 가능.
+    종료된 잡(DONE/FAILED/CANCELLED) 은 거부.
+    """
+    spec = _get_owned_or_admin(job_id, user)
+    try:
+        result = await finalize_job(job_id, reason=f"user:{user.id}")
+    except WFPError as e:
+        raise HTTPException(status_code=409, detail=e.to_dict()) from e
+    log.info("job_finalize_invoked",
+             extra={"user_id": user.id, "job_id": job_id, "extra": result})
+    _ = spec
+    return result
+
+
 @router.get("/{job_id}/artifacts/{kind}")
 def download_artifact(
     job_id: str,
@@ -332,6 +394,35 @@ def download_artifact(
     }
     media = media_map.get(path.suffix.lower(), "application/octet-stream")
     return FileResponse(path=str(path), filename=path.name, media_type=media)
+
+
+@router.get("/{job_id}/data/raw")
+def download_raw_data(
+    job_id: str,
+    user: User = Depends(get_current_user),
+) -> FileResponse:
+    """
+    Stage 5 수집 직후 원시 데이터(JSONL) 다운로드.
+
+    경로: ~/.wfp/jobs/<job_id>/raw/collected.jsonl
+    모든 data_source_mode (UPLOAD/DIRECTORY/WEB) 동일 위치.
+    SYNTHETIC 은 수집 단계가 없어 404.
+    소유자 또는 ADMIN.
+    """
+    spec = _get_owned_or_admin(job_id, user)
+
+    raw_path = Path.home() / ".wfp" / "jobs" / str(spec.job_id) / "raw" / "collected.jsonl"
+    if not raw_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="수집된 원시 데이터 없음. 잡이 Stage 5(데이터 수집)에 진입했는지 확인하세요.",
+        )
+
+    return FileResponse(
+        path=str(raw_path),
+        filename=f"{job_id[:8]}-collected.jsonl",
+        media_type="application/x-ndjson",
+    )
 
 
 class HFUploadRequest(BaseModel):
@@ -453,6 +544,7 @@ def _to_detail(spec: JobSpec) -> JobDetail:
         keywords=spec.keywords,
         train_override=spec.train_override,
         events=get_job_events(str(spec.job_id)),
+        last_event_at=get_last_event_at(str(spec.job_id)),
     )
 
 

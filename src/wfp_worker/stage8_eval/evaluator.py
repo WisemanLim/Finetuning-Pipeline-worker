@@ -164,13 +164,22 @@ class ModelEvaluator:
         test_file = str(Path(spec.dataset_path) / "test.jsonl")
         dataset = load_dataset("json", data_files={"test": test_file})["test"]
 
-        cb(str(spec.job_id), 8, f"테스트셋 {len(dataset)}건 추론 중...", {})
+        eval_subset = dataset.select(range(min(100, len(dataset))))
+        total = len(eval_subset)
+        cb(
+            str(spec.job_id), 8,
+            f"테스트셋 {total}건 추론 시작",
+            {"step": 0, "total_steps": total, "stage_progress": 0.0},
+        )
 
         predictions: list[str] = []
         references: list[str] = []
 
+        # 매 step 발행은 과도 — 1% 또는 1 step 간격
+        emit_interval = max(1, total // 100)
+
         # 배치 추론
-        for item in dataset.select(range(min(100, len(dataset)))):
+        for idx, item in enumerate(eval_subset):
             ref = str(item.get("output", item.get("text", "")))
             prompt = str(item.get("instruction", item.get("text", "")))
 
@@ -193,17 +202,33 @@ class ModelEvaluator:
             predictions.append(pred)
             references.append(ref)
 
+            step = idx + 1
+            if step % emit_interval == 0 or step == total:
+                cb(
+                    str(spec.job_id), 8,
+                    f"추론 {step}/{total}",
+                    {"step": step, "total_steps": total,
+                     "stage_progress": step / total},
+                )
+
+        cb(str(spec.job_id), 8, "추론 완료 — 메트릭 계산 중", {})
+
         # Perplexity
         result.perplexity = self._compute_perplexity(model, tokenizer, references[:20])
+        cb(str(spec.job_id), 8, "Perplexity 계산 완료",
+           {"perplexity": result.perplexity})
 
         # ROUGE
         rouge_scores = self._compute_rouge(predictions, references)
         result.rouge1 = rouge_scores.get("rouge1", 0.0)
         result.rouge2 = rouge_scores.get("rouge2", 0.0)
         result.rougeL = rouge_scores.get("rougeL", 0.0)
+        cb(str(spec.job_id), 8, "ROUGE 계산 완료",
+           {"rouge1": result.rouge1, "rougeL": result.rougeL})
 
         # F1 (토큰 수준)
         result.f1 = self._compute_token_f1(predictions, references)
+        cb(str(spec.job_id), 8, "F1 계산 완료", {"f1": result.f1})
 
         # Exact match
         result.exact_match = sum(

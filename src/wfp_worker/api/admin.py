@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from wfp_worker.auth import get_current_admin
+from wfp_worker.common.logger import get_logger
 from wfp_worker.db import (
     AdminNotification,
     AuditLog,
@@ -53,6 +54,7 @@ from wfp_worker.db import (
 from wfp_worker.runtime import _jobs
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+log = get_logger(__name__)
 
 
 # ─────────────────────────────────────────
@@ -960,3 +962,225 @@ def patch_notification(
     db.refresh(n)
     _audit(db, actor, "notification_patch", target=notif_id, detail=body.status)
     return _to_notif(n)
+
+
+# ─────────────────────────────────────────
+# 기본값 시드 — _ALL_MODELS / PRD §3.2 프리셋 / allow-all 화이트리스트 일괄 삽입
+# ─────────────────────────────────────────
+
+
+class SeedDefaultsResult(BaseModel):
+    models_added: int
+    presets_added: int
+    whitelist_added: int
+    models_existing: int
+    presets_existing: int
+    whitelist_existing: int
+
+
+# KSIC 별 기본 프리셋 (PRD §3.2). 추천 모델은 _ALL_MODELS 기준 hf_repo 직접 참조.
+_PRESET_SEEDS: list[tuple[str, str, str, list[str], str]] = [
+    ("C", "제조업 기본", "chat",
+     ["Qwen/Qwen2-7B-Instruct", "mistralai/Mistral-7B-Instruct-v0.3"],
+     "제조업 — 매뉴얼/규격 기반 챗"),
+    ("G", "도매·소매 기본", "chat",
+     ["meta-llama/Llama-3-8B-Instruct", "Qwen/Qwen2-7B-Instruct"],
+     "상품 카탈로그/FAQ instruction"),
+    ("I", "숙박·음식점 기본", "chat",
+     ["google/gemma-2-9b-it", "microsoft/Phi-3-medium-4k-instruct"],
+     "메뉴/리뷰 톤·매너 튜닝"),
+    ("J", "정보통신·코드", "code",
+     ["Qwen/Qwen2.5-Coder-7B-Instruct", "deepseek-ai/deepseek-coder-6.7b-instruct",
+      "codellama/CodeLlama-13b-Instruct-hf"],
+     "코드 특화"),
+    ("K", "금융·보험", "chat",
+     ["meta-llama/Llama-3-8B-Instruct", "Qwen/Qwen2-14B-Instruct"],
+     "공시/약관 — 안전성 평가 강화"),
+    ("M", "전문·과학·기술", "chat",
+     ["meta-llama/Llama-3-8B-Instruct", "mistralai/Mistral-7B-Instruct-v0.3"],
+     "논문/특허 긴 컨텍스트"),
+    ("P", "교육", "chat",
+     ["google/gemma-2-9b-it", "meta-llama/Llama-3-8B-Instruct"],
+     "교과서/문제은행 난이도 조절"),
+    ("Q", "보건·의료", "qa",
+     ["BioMistral/BioMistral-7B", "epfl-llm/meditron-7b",
+      "meta-llama/Llama-3-8B-Instruct"],
+     "임상가이드 — 근거성 평가 강화"),
+    ("F", "건설", "chat",
+     ["mistralai/Mistral-7B-Instruct-v0.3", "Qwen/Qwen2-7B-Instruct"],
+     "건설표준시방서/KS"),
+]
+
+
+@router.post("/catalog/seed-defaults", response_model=SeedDefaultsResult)
+def seed_defaults(
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> SeedDefaultsResult:
+    """
+    빈 카탈로그 초기 시드:
+      1. _ALL_MODELS → ModelCatalogEntry (hf_repo 중복 건 skip)
+      2. PRD §3.2 카테고리 프리셋 (name 중복 skip)
+      3. allow-all 화이트리스트 한 건 (없으면 추가)
+
+    같은 hf_repo / preset name / whitelist name 이 이미 있으면 skip.
+    soft-delete (is_active=false) 된 행은 그대로 둠 — 의도된 비활성 보존.
+    """
+    from wfp_worker.stage4_model.model_catalog import _ALL_MODELS
+
+    # 1. 모델
+    existing_repos = {e.hf_repo for e in db.query(ModelCatalogEntry).all()}
+    models_added = 0
+    for m in _ALL_MODELS:
+        if m.hf_repo in existing_repos:
+            continue
+        db.add(ModelCatalogEntry(
+            hf_repo=m.hf_repo,
+            params_b=m.params_b,
+            license=m.license,
+            hw_min_vram_gb=m.hw_min_vram_gb,
+            language=",".join(m.language),
+            tags=",".join(m.tags),
+            priority=m.priority,
+        ))
+        models_added += 1
+
+    # 2. 프리셋
+    existing_names = {p.name for p in db.query(CategoryPreset).all()}
+    presets_added = 0
+    for section, name, task_type, models, desc in _PRESET_SEEDS:
+        if name in existing_names:
+            continue
+        db.add(CategoryPreset(
+            name=name,
+            ksic_section=section,
+            task_type=task_type,
+            recommended_models=",".join(models),
+            default_config_json="{}",
+            description=desc,
+        ))
+        presets_added += 1
+
+    # 3. allow-all 화이트리스트
+    existing_ws = {w.name for w in db.query(DataSourceWhitelist).all()}
+    whitelist_added = 0
+    if "allow-all" not in existing_ws:
+        db.add(DataSourceWhitelist(
+            name="allow-all",
+            source_type="url",
+            url_pattern=".*",
+            description="기본 허용 — 모든 URL/도메인 통과. 운영 환경에서는 좁히세요.",
+        ))
+        whitelist_added += 1
+
+    db.commit()
+    _audit(db, actor, "catalog_seed_defaults",
+           detail=f"models+{models_added}, presets+{presets_added}, ws+{whitelist_added}")
+
+    return SeedDefaultsResult(
+        models_added=models_added,
+        presets_added=presets_added,
+        whitelist_added=whitelist_added,
+        models_existing=len(existing_repos),
+        presets_existing=len(existing_names),
+        whitelist_existing=len(existing_ws),
+    )
+
+
+# ─────────────────────────────────────────
+# HF Hub 검색 — 카탈로그 추가 시 자동완성 보조 (PRD §10.4 모델 갱신)
+# ─────────────────────────────────────────
+
+
+class HfSearchResultItem(BaseModel):
+    hf_repo: str
+    downloads: int = 0
+    likes: int = 0
+    tags: list[str] = []
+    params_b: float | None = None
+
+
+# 간단 in-memory 캐시 — (query, limit) → (ts, result). Rate limit 회피.
+_hf_cache: dict[tuple[str, int], tuple[float, list[HfSearchResultItem]]] = {}
+_HF_CACHE_TTL_SEC = 300  # 5분
+
+
+def _parse_params_b(model_info: object) -> float | None:
+    """HF ModelInfo → 추정 파라미터(B). tags / repo id 의 'XB' 패턴 파싱."""
+    import re
+
+    tags = getattr(model_info, "tags", None) or []
+    for t in tags:
+        m = re.match(r"^(\d+(?:\.\d+)?)b$", str(t).strip().lower())
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                continue
+    repo = getattr(model_info, "id", None) or getattr(model_info, "modelId", None) or ""
+    m = re.search(r"(\d+(?:\.\d+)?)b(?:[-_/.]|$)", str(repo).lower())
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+@router.get("/hf-search", response_model=list[HfSearchResultItem])
+def hf_search(
+    q: str,
+    limit: int = 10,
+    _: User = Depends(get_current_admin),
+) -> list[HfSearchResultItem]:
+    """
+    HF Hub 모델 검색. 카탈로그 추가 시 hf_repo 자동완성용.
+
+    Parameters
+    ----------
+    q     검색어 (예: "qwen", "llama-3-8b").
+    limit 최대 결과 수 (기본 10, 최대 30).
+    """
+    q = (q or "").strip()
+    if not q:
+        return []
+    limit = max(1, min(limit, 30))
+
+    cache_key = (q, limit)
+    import time
+    now = time.time()
+    cached = _hf_cache.get(cache_key)
+    if cached and (now - cached[0]) < _HF_CACHE_TTL_SEC:
+        return cached[1]
+
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503,
+            detail="huggingface_hub 미설치 — 관리자 환경 점검 필요",
+        ) from e
+
+    try:
+        api = HfApi()
+        models = api.list_models(
+            search=q, limit=limit, sort="downloads", direction=-1,
+        )
+        results: list[HfSearchResultItem] = []
+        for m in models:
+            repo = getattr(m, "id", None) or getattr(m, "modelId", None) or ""
+            if not repo:
+                continue
+            results.append(HfSearchResultItem(
+                hf_repo=str(repo),
+                downloads=int(getattr(m, "downloads", 0) or 0),
+                likes=int(getattr(m, "likes", 0) or 0),
+                tags=[str(t) for t in (getattr(m, "tags", None) or [])][:20],
+                params_b=_parse_params_b(m),
+            ))
+    except Exception as e:
+        log.warning("hf_search_failed", extra={"extra": {"q": q, "err": str(e)}})
+        raise HTTPException(status_code=502, detail=f"HF Hub 검색 실패: {e}") from e
+
+    _hf_cache[cache_key] = (now, results)
+    return results

@@ -683,3 +683,44 @@ Finetuning-Pipeline-worker/
 ## 라이선스
 
 내부 사용 전용. 베이스 모델 각각의 라이선스를 확인하고 준수할 것.
+
+---
+
+## 최근 변경 (2026-05)
+
+### 파이프라인 안정성
+
+- **`_run_pipeline` 분해 + `start_stage` 파라미터** — Stage 2~9 각각 `_stage_N_*` 함수로 분리. `_STAGE_RUNNERS` dict 매핑. 임의 stage 부터 재진입 가능 → advance 기능 기반.
+- **`_make_progress_cb` thread-safe 수정** — `asyncio.to_thread` 워커 스레드에서 `get_event_loop()` / `ensure_future` 가 동작 안 함 (메인 루프 미보유). `asyncio.get_running_loop()` 로 메인 루프 캡처 후 `run_coroutine_threadsafe` 디스패치. 학습/평가 step 이벤트 누락 해결.
+- **`last_event_at` 메타 추적** — `_emit_ws` 호출마다 갱신, `_job_last_event_at` dict 저장, `save_state()` 디스크 영속화 포함. 클라이언트 멈춤 감지에 사용.
+- **`_job_tasks` / `_job_reqs`** — asyncio.Task / 원본 req 보존. advance 시 cancel + 새 task spawn 필요.
+
+### 신규 엔드포인트
+
+| Method | Path | 권한 | 설명 |
+|---|---|---|---|
+| `GET`  | `/jobs/{job_id}/data/raw`        | 소유자/admin | Stage 5 수집 raw JSONL 다운로드 (`~/.wfp/jobs/<id>/raw/collected.jsonl`). UPLOAD/DIR/WEB 모두 대응. SYNTHETIC 은 404. |
+| `POST` | `/jobs/{job_id}/advance`         | 소유자/admin | 현재 stage 강제 스킵 + 다음 stage 부터 재실행. 종료된 잡은 409. |
+| `POST` | `/jobs/{job_id}/finalize`        | 소유자/admin | 잡 조기 종료 (현재 산출물로 DONE 마킹). |
+| `GET`  | `/admin/hf-search?q=...&limit=N` | admin | HF Hub 모델 검색 (5분 in-memory 캐시, params_b 추정). |
+| `POST` | `/admin/catalog/seed-defaults`   | admin | _ALL_MODELS + PRD §3.2 프리셋 + allow-all 화이트리스트 일괄 시드 (중복 skip). |
+
+### Stage 8 평가 진행 이벤트
+
+- `_run_pipeline` 에서 `eval_cb = _make_progress_cb(job_id)` 를 evaluator 에 전달 (기존엔 `None` 으로 모든 평가 이벤트 무음 드롭).
+- `ModelEvaluator._run_metrics` 추론 루프 — step 마다 (1% 간격) `step` / `total_steps` / `stage_progress` 발행. 메트릭별 (`Perplexity / ROUGE / F1`) 완료 이벤트도 emit.
+
+### 에러 코드
+
+- `WFP-9001` JOB_NOT_FOUND — advance/finalize 대상 잡 없음.
+- `WFP-9002` INVALID_STATE — 종료된 잡(DONE/FAILED/CANCELLED) 에 진행 시도.
+
+### JobDetail 응답
+
+- `last_event_at: str | None` 추가. 클라이언트가 5분 무이벤트로 멈춤 감지.
+
+### 인증/권한 (변경 없음, 확인용 정리)
+
+- `get_current_user` — 토큰 없음 → 401. 무효/만료 → 401.
+- `get_current_admin` — `role != ADMIN` → 403.
+- `_get_owned_or_admin` (api/jobs.py) — `spec.user_id != user.id` 이며 admin 도 아니면 403. **모든 잡 라우트 (`/jobs/{id}`, `/jobs/{id}/artifacts/...`, `/jobs/{id}/data/raw`, `/jobs/{id}/advance`, `/jobs/{id}/finalize`)** 이 가드 통과 필수.
