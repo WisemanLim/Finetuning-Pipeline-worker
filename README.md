@@ -719,6 +719,29 @@ Finetuning-Pipeline-worker/
 
 - `last_event_at: str | None` 추가. 클라이언트가 5분 무이벤트로 멈춤 감지.
 
+### 배포/실행 시 editable install 필수
+
+worker 는 `wfp_worker` 패키지를 `.venv` 에 **editable** 로 설치해야 코드 변경이 즉시 반영된다. site-packages 에 일반 설치(`pip install .`) 되어 있으면:
+
+- 새 라우트 추가 / 버그 수정이 운영에 반영 안 됨 → `{"detail":"Not Found"}` 같은 404 발생.
+- 신규 endpoint 가 OpenAPI 에 등장하지 않음.
+
+복구:
+
+```bash
+cd <worker_dir>
+uv pip install -e . --no-deps --force-reinstall --python .venv/bin/python
+.venv/bin/python -c "import wfp_worker; print(wfp_worker.__path__)"
+# 기대: ['/path/to/Finetuning-Pipeline-worker/src/wfp_worker']
+```
+
+ops Makefile 의 `make dev-worker` / `make prod-worker` 는 `worker-editable` 타깃에 의존하여 매 호출마다 editable 보장 (idempotent).
+
+수동 강제 재설치 (의도적):
+```bash
+make -C <ops_dir> reinstall-worker
+```
+
 ### tqdm → WebSocket 브리지 (NEW)
 
 - [common/tqdm_bridge.py](src/wfp_worker/common/tqdm_bridge.py) — `tqdm.std.tqdm` / `tqdm.auto.tqdm` / `tqdm.tqdm` 을 `WfpTqdm` 서브클래스로 monkey-patch.
