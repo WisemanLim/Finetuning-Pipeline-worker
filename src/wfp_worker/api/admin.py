@@ -19,6 +19,8 @@
     GET/POST/PATCH/DELETE /admin/catalog/models      모델 카탈로그 CRUD
     GET/POST/PATCH/DELETE /admin/data-sources        데이터 소스 화이트리스트 CRUD
     GET/POST/PATCH/DELETE /admin/presets             카테고리/프리셋 CRUD
+    POST  /admin/catalog/seed-defaults               기본 시드 (1회용)
+    POST  /admin/catalog/auto-refresh                HF Hub trending 기반 자동 갱신
 
   10.5 감사 로그
     GET   /admin/audit                감사 로그 (필터 지원)
@@ -1085,6 +1087,42 @@ def seed_defaults(
         presets_existing=len(existing_names),
         whitelist_existing=len(existing_ws),
     )
+
+
+# ─────────────────────────────────────────
+# 카탈로그 자동 갱신 — HF Hub trending 기반 모델/프리셋 보강
+# ─────────────────────────────────────────
+
+
+class AutoRefreshResult(BaseModel):
+    models_added: int
+    models_skipped: int
+    presets_added: int
+    presets_updated: int
+    presets_unchanged: int
+    hf_search_errors: int
+    queries_run: int
+
+
+@router.post("/catalog/auto-refresh", response_model=AutoRefreshResult)
+def auto_refresh_catalog(
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> AutoRefreshResult:
+    """
+    HF Hub trending + KSIC 섹션 매핑으로 모델/프리셋 자동 갱신.
+
+    - 모델: 라이선스 safelist + 다운로드 임계 통과한 신규 hf_repo 만 INSERT.
+      기존 행은 운영자 편집 보존 위해 손대지 않음.
+    - 프리셋: 활성 카탈로그 + 섹션 태그 매칭으로 추천 모델 재계산.
+      task_type/description 은 비어있을 때만 채움.
+    """
+    from wfp_worker.admin_tools.catalog_refresher import refresh_catalog
+
+    summary = refresh_catalog(db)
+    db.commit()
+    _audit(db, actor, "catalog_auto_refresh", detail=str(summary.to_dict()))
+    return AutoRefreshResult(**summary.to_dict())
 
 
 # ─────────────────────────────────────────

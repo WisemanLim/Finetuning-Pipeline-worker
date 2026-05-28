@@ -108,8 +108,11 @@ source .venv/bin/activate
 
 ### 개발 모드
 
+> **모든 `make` 명령은 `Finetuning-Pipeline-ops`에서 실행.** 이 저장소 자체에는 Makefile 없음.
+
 ```bash
-# 권장 — Finetuning-Pipeline-ops Makefile (.env 자동 로드)
+# 권장 — ops Makefile (.env 자동 로드, worker-editable 자동 보장)
+cd ~/Developer/Web\(Node,Script\)/Finetuning-Pipeline-ops
 make dev-worker
 
 # 또는 직접 실행 (사전에 export 또는 .env 수동 소스 필요)
@@ -145,10 +148,13 @@ curl http://localhost:8000/hw/caps | python3 -m json.tool
 
 `Finetuning-Pipeline-ops/docker/`에 통합 compose 파일이 있다. Makefile이 호스트의 GPU 유무를 자동 감지해 CPU/GPU 모드를 선택한다.
 
+> **모든 `make` 명령은 `Finetuning-Pipeline-ops` 디렉토리에서 실행.**
+> Worker 저장소 자체에는 Makefile이 없다 — 통일된 운영 명령은 ops에 모여 있음.
+
 #### 전체 컨테이너 모드
 
 ```bash
-# Finetuning-Pipeline-ops 저장소에서
+cd ~/Developer/Web\(Node,Script\)/Finetuning-Pipeline-ops
 make docker-dev          # GPU 자동 감지 (worker 컨테이너 안에서 실행)
 make docker-dev-cpu      # CPU 강제
 make docker-dev-gpu      # GPU 강제 (nvidia 런타임 필요)
@@ -456,6 +462,9 @@ for a in artifacts:
 | CRUD     | `/admin/catalog/models[/{id}]` | 모델 카탈로그 | §10.4 |
 | CRUD     | `/admin/data-sources[/{id}]` | 데이터 소스 화이트리스트 | §10.4 |
 | CRUD     | `/admin/presets[/{id}]` | KSIC/태스크 프리셋 | §10.4 |
+| `POST`   | `/admin/catalog/seed-defaults` | `_ALL_MODELS` + PRD 프리셋 + allow-all 일괄 시드 | §10.4 |
+| `POST`   | `/admin/catalog/auto-refresh` | HF Hub trending 기반 모델/프리셋 자동 갱신 | §10.4 |
+| `GET`    | `/admin/hf-search?q=...&limit=N` | HF Hub 모델 검색 (자동완성, 5분 캐시) | §10.4 |
 | `GET`    | `/admin/users` | 사용자 목록 | |
 | `PATCH`  | `/admin/users/{id}` | 권한/활성 토글 | |
 | `GET`    | `/admin/audit` | 감사 로그 (필터: actor_email/action/date) | §10.5 |
@@ -704,6 +713,29 @@ Finetuning-Pipeline-worker/
 | `POST` | `/jobs/{job_id}/finalize`        | 소유자/admin | 잡 조기 종료 (현재 산출물로 DONE 마킹). |
 | `GET`  | `/admin/hf-search?q=...&limit=N` | admin | HF Hub 모델 검색 (5분 in-memory 캐시, params_b 추정). |
 | `POST` | `/admin/catalog/seed-defaults`   | admin | _ALL_MODELS + PRD §3.2 프리셋 + allow-all 화이트리스트 일괄 시드 (중복 skip). |
+| `POST` | `/admin/catalog/auto-refresh`    | admin | HF Hub trending + KSIC 휴리스틱 매핑으로 모델/프리셋 자동 추가·갱신. 기존 모델 행은 운영자 편집 보존. CLI 동등 명령: `make -C <ops> catalog-refresh`. |
+
+### 카탈로그 자동 갱신 (admin_tools)
+
+운영 중 모델 카탈로그/프리셋을 코드 시드 외에도 자동으로 보강. `src/wfp_worker/admin_tools/catalog_refresher.py`.
+
+- **소스**: HuggingFace Hub trending 검색 (`HfApi.list_models`, sort=downloads).
+- **필터**: 라이선스 safelist (apache-2.0/mit/llama2/llama3/gemma/deepseek/bsd-3-clause) + 다운로드 ≥500 + params 0.5–70B.
+- **태그 추정**: HF tags + repo 이름에서 `code` / `medical` / `finance` / `general` 자동 추정 + 한국어 친화 vendor(Qwen, Llama-3 등)는 `ko` 자동 부여.
+- **모델 INSERT 전용**: 기존 hf_repo 행은 절대 수정하지 않음 (운영자 편집 보존). soft-deleted 행도 그대로.
+- **프리셋 재계산**: 9개 KSIC 섹션별로 활성 카탈로그 + 섹션 태그 매칭으로 추천 모델 5건 갱신. `task_type`/`description`은 비어있을 때만 채움.
+
+호출 방식:
+
+```bash
+# 1. 관리자 화면 — '자동 갱신' 버튼 (카탈로그 페이지, 기본값 가져오기 옆)
+# 2. REST API
+curl -X POST http://localhost:8000/admin/catalog/auto-refresh -H "Authorization: Bearer $TOKEN"
+# 3. CLI / cron (ops Makefile 경유)
+make -C ~/Developer/Web\(Node,Script\)/Finetuning-Pipeline-ops catalog-refresh
+```
+
+응답: `{models_added, models_skipped, presets_added, presets_updated, presets_unchanged, hf_search_errors, queries_run}`.
 
 ### Stage 8 평가 진행 이벤트
 
