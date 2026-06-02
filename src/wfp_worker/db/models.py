@@ -86,6 +86,14 @@ class ModelCatalogEntry(Base):
     tags: Mapped[str] = mapped_column(String(255), default="general")     # CSV
     priority: Mapped[int] = mapped_column(Integer, default=5)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # 출처 — "hf" (HF 공식) / "finetuned" (Stage 9 자동등록) / "upload" (사용자 파일)
+    source: Mapped[str] = mapped_column(String(16), default="hf", nullable=False)
+    # 사용자 모델 공개 여부 (source!="hf" 일 때만 의미)
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 로컬 경로 — finetuned 체크포인트 / upload 디렉토리
+    local_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # 생성 user — finetuned 자동 등록 시 잡 소유자
+    owner_user_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, onupdate=_utc_now

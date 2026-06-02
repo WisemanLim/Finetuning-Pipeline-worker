@@ -132,11 +132,28 @@ async def create_job(
     spec.data_source_path = req.data_source_path or ""
     spec.keywords = req.keywords or []
     spec.train_override = req.train_override or {}
-    # DEPRECATED 2026-05: 사용자 HF 토큰 스냅샷 비활성. gated repo 다운로드는
-    # AdminNotification(kind="hf_gated") → 관리자가 /admin/jobs/{id}/resume-download
-    # 로 admin HF_TOKEN 사용해 진행. 사용자 평문 토큰 채널 차단.
-    # if user.hf_token_encrypted:
-    #     spec.hf_token = user.hf_token_encrypted
+    # HF 토큰 자동 주입 — 우선순위: env HF_TOKEN > admin user DB hf_token_encrypted.
+    # 일반 사용자 토큰은 사용 안 함 (UI 도 admin role 만 노출). 실패 시 admin
+    # notification 자동 생성 → 관리자가 /admin/jobs/{id}/model-download 로 처리.
+    import os as _os
+    _env_tok = _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if _env_tok:
+        spec.hf_token = _env_tok
+    else:
+        try:
+            from sqlalchemy.orm import Session as _Session
+            from wfp_worker.db import SessionLocal as _SL, User as _U, UserRole as _UR
+            with _SL() as _db:  # type: _Session
+                admin = (
+                    _db.query(_U)
+                    .filter(_U.role == _UR.ADMIN, _U.hf_token_encrypted.isnot(None))
+                    .order_by(_U.created_at.asc())
+                    .first()
+                )
+                if admin and admin.hf_token_encrypted:
+                    spec.hf_token = admin.hf_token_encrypted
+        except Exception:
+            pass
 
     job_id = str(spec.job_id)
     _jobs[job_id] = spec

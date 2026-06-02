@@ -294,7 +294,11 @@ async def _stage_3_env(spec: JobSpec, req: dict[str, Any], emit: _EmitFn) -> Non
 
 
 async def _stage_4_model(spec: JobSpec, req: dict[str, Any], emit: _EmitFn) -> None:
-    """Stage 4 — Model Pick + Download."""
+    """Stage 4 — Model Pick + Download.
+
+    HF 토큰 누락(WFP-0405) / 라이선스 미동의(WFP-0403) 발생 시 admin notification
+    자동 생성. 관리자가 /admin/jobs/{id}/model-download 로 사전 검증 후 재시도.
+    """
     await emit("Stage 4: 모델 선택", {"stage": 4})
     from wfp_worker.stage4_model import ModelDownloader, ModelPicker
     await asyncio.to_thread(ModelPicker().pick, spec, req.get("model_hf_repo") or None)
@@ -305,88 +309,55 @@ async def _stage_4_model(spec: JobSpec, req: dict[str, Any], emit: _EmitFn) -> N
     try:
         await asyncio.to_thread(ModelDownloader(progress_cb=dl_cb).download, spec)
     except WFPError as e:
-        # gated repo / 토큰 부재 → 관리자 알림 생성 + 잡 FAILED 마킹.
-        # 관리자는 /admin/jobs/{id}/resume-download 로 라이선스 사전 점검 후 재다운로드.
-        if e.code in (WFPErrorCode.LICENSE_NOT_ACCEPTED, WFPErrorCode.HF_TOKEN_MISSING):
-            _create_hf_gated_notification(spec, e)
+        if e.code in (WFPErrorCode.HF_TOKEN_MISSING, WFPErrorCode.LICENSE_NOT_ACCEPTED):
+            await asyncio.to_thread(_create_model_download_notification, spec, e)
             await emit(
-                f"⚠ Stage 4: {e.message} — 관리자 알림 생성",
-                {"stage": 4, "code": e.code.value, "detail": e.detail,
-                 "repo": spec.model_hf_repo, "admin_action_required": True},
+                "관리자 알림 생성 — 모델 다운로드 승인 필요",
+                {"stage": 4, "notification": True, "repo": spec.model_hf_repo,
+                 "code": e.code.value},
             )
         raise
     await emit("Stage 4 완료", {"model": spec.model_hf_repo, "stage": 4})
 
 
-def _create_hf_gated_notification(spec: JobSpec, err: "WFPError") -> None:
-    """HF gated/토큰 부재 시 AdminNotification 한 건 생성.
+def _create_model_download_notification(spec: JobSpec, err: WFPError) -> None:
+    """Stage 4 HF 권한/라이선스 실패 시 admin_notifications 행 INSERT.
 
-    중복 방지: 동일 (job_id, kind=hf_gated, status=new) 이미 있으면 skip.
-    DB 세션 실패해도 잡 흐름은 깨지지 않도록 silent fallback.
+    별도 DB 세션 사용 — runtime 은 async 컨텍스트라 FastAPI Depends 미사용.
     """
+    import json as _json
     try:
-        import json as _json
-
-        from wfp_worker.db import AdminNotification, User
-        from wfp_worker.db.session import SessionLocal  # type: ignore
-    except Exception:
+        from wfp_worker.db import AdminNotification, SessionLocal
+    except ImportError:
+        log.warning("admin_notification_skip — db 모듈 import 실패")
         return
-    db = None
     try:
-        db = SessionLocal()
-        existing = (
-            db.query(AdminNotification)
-            .filter(
-                AdminNotification.job_id == str(spec.job_id),
-                AdminNotification.kind == "hf_gated",
-                AdminNotification.status == "new",
+        with SessionLocal() as db:
+            n = AdminNotification(
+                user_id=str(getattr(spec, "user_id", "") or ""),
+                user_email=str(getattr(spec, "user_email", "") or "system"),
+                job_id=str(spec.job_id),
+                kind="model_download",
+                error_code=err.code.value,
+                message=f"모델 다운로드 승인 필요: {spec.model_hf_repo}",
+                detail_json=_json.dumps({
+                    "repo_id": spec.model_hf_repo,
+                    "hf_url": f"https://huggingface.co/{spec.model_hf_repo}",
+                    "error_code": err.code.value,
+                    "detail": err.detail or "",
+                }),
+                status="new",
             )
-            .first()
-        )
-        if existing:
-            return
-        # 사용자 이메일 lookup — 없어도 알림은 생성.
-        user_email = ""
-        if spec.user_id:
-            u = db.get(User, spec.user_id)
-            if u:
-                user_email = u.email
-        db.add(AdminNotification(
-            user_id=spec.user_id or "",
-            user_email=user_email,
-            job_id=str(spec.job_id),
-            kind="hf_gated",
-            error_code=err.code.value,
-            message=err.message,
-            detail_json=_json.dumps({
-                "repo": spec.model_hf_repo,
-                "stage": 4,
-                "instructions": [
-                    f"https://huggingface.co/{spec.model_hf_repo} 방문 (관리자 HF 계정 로그인)",
-                    "Access repository 버튼 클릭",
-                    "라이선스 동의 form 제출",
-                    "승인 대기 (Gemma 등은 즉시, 일부 모델은 수동 review)",
-                    f"승인 후 POST /admin/jobs/{spec.job_id}/resume-download 호출",
-                ],
-                "detail": err.detail,
-            }),
-            status="new",
-        ))
-        db.commit()
-        log.info(
-            "hf_gated_notification_created",
-            extra={"job_id": str(spec.job_id),
-                   "extra": {"repo": spec.model_hf_repo, "code": err.code.value}},
-        )
-    except Exception as ex:
-        log.warning("hf_gated_notification_failed",
-                    extra={"extra": {"err": str(ex), "job_id": str(spec.job_id)}})
-    finally:
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
+            db.add(n)
+            db.commit()
+            log.info(
+                "admin_notification_created",
+                extra={"job_id": str(spec.job_id),
+                       "extra": {"kind": "model_download", "code": err.code.value}},
+            )
+    except Exception as e:
+        log.warning("admin_notification_insert_failed",
+                    extra={"extra": {"err": str(e)}})
 
 
 async def _stage_5_data(spec: JobSpec, req: dict[str, Any], emit: _EmitFn) -> None:
@@ -445,13 +416,76 @@ async def _stage_8_eval(spec: JobSpec, req: dict[str, Any], emit: _EmitFn) -> No
 
 
 async def _stage_9_package(spec: JobSpec, req: dict[str, Any], emit: _EmitFn) -> None:
-    """Stage 9 — 패키징."""
+    """Stage 9 — 패키징 + catalog 자동 등록 (finetuned, 비공개 기본)."""
     await emit("Stage 9: 패키징 시작", {"stage": 9})
     from wfp_worker.stage9_package import Packager
     artifacts = await asyncio.to_thread(Packager().package, spec)
+    # finetuned 모델 catalog 자동 등록 — 비공개 기본
+    catalog_id = await asyncio.to_thread(_register_finetuned_catalog, spec)
+    if catalog_id:
+        await emit("Catalog 자동 등록 — 사용자(비공개)",
+                   {"stage": 9, "catalog_id": catalog_id})
     await emit("파이프라인 완료", {
         "artifacts": [a.kind.value for a in artifacts], "stage": 9,
     })
+
+
+def _register_finetuned_catalog(spec: JobSpec) -> str | None:
+    """Stage 9 후 fine-tuned 결과를 catalog 에 등록. is_public=False (비공개).
+
+    hf_repo 식별: `ft://<user_id_short>/<base>__<job_short>` 유일 키.
+    """
+    try:
+        from wfp_worker.db import ModelCatalogEntry, SessionLocal
+    except ImportError:
+        return None
+    try:
+        ckpt = spec.checkpoint_dir or ""
+        base = spec.model_hf_repo or "base"
+        job_short = str(spec.job_id)[:8]
+        user_short = (str(getattr(spec, "user_id", "") or "anon"))[:8]
+        repo_key = f"ft://{user_short}/{base.replace('/', '__')}__{job_short}"
+
+        # 파라미터 — base 모델 추정 (catalog 에 있으면 가져옴)
+        params_b = 0.0
+        with SessionLocal() as db:
+            existing = db.query(ModelCatalogEntry).filter(
+                ModelCatalogEntry.hf_repo == repo_key,
+            ).first()
+            if existing:
+                return existing.id
+            # base 모델 carry-over
+            base_row = db.query(ModelCatalogEntry).filter(
+                ModelCatalogEntry.hf_repo == base,
+            ).first()
+            if base_row:
+                params_b = base_row.params_b
+
+            entry = ModelCatalogEntry(
+                hf_repo=repo_key,
+                params_b=params_b or 0.0,
+                license="ft-derived",
+                hw_min_vram_gb=base_row.hw_min_vram_gb if base_row else 0.0,
+                language=base_row.language if base_row else "ko,en",
+                tags=(base_row.tags + ",finetuned") if base_row else "finetuned",
+                priority=99,
+                is_active=True,
+                source="finetuned",
+                is_public=False,
+                local_path=ckpt,
+                owner_user_id=str(getattr(spec, "user_id", "") or "") or None,
+            )
+            db.add(entry)
+            db.commit()
+            db.refresh(entry)
+            log.info("catalog_finetuned_registered",
+                     extra={"job_id": str(spec.job_id),
+                            "extra": {"catalog_id": entry.id, "repo": repo_key}})
+            return entry.id
+    except Exception as e:
+        log.warning("catalog_finetuned_register_failed",
+                    extra={"extra": {"err": str(e)}})
+        return None
 
 
 _STAGE_RUNNERS: dict[int, Callable[..., Awaitable[None]]] = {
@@ -653,70 +687,35 @@ async def advance_job(job_id: str, *, reason: str = "user") -> dict[str, Any]:
         return {"advanced_from": from_stage, "new_start_stage": next_stage, "restarted": True}
 
 
-async def revive_job_from_stage(
-    job_id: str, start_stage: int, *, reason: str = "admin"
-) -> dict[str, Any]:
-    """종료된 (FAILED) 잡을 부활 — 지정 stage 부터 재실행.
+async def retry_from_stage(job_id: str, stage: int, *, reason: str = "admin") -> dict[str, Any]:
+    """지정 stage 부터 파이프라인 재시작. 관리자가 Stage 4 모델 다운로드 승인 후 사용.
 
-    Stage 4 gated repo 차단으로 FAILED 된 잡을 관리자가 모델 다운로드 완료 후
-    Stage 5 부터 재개할 때 사용. DONE/CANCELLED 는 거부.
-
-    Parameters
-    ----------
-    start_stage:
-        재개 시작 stage (2~9). 보통 다운로드 후라면 5.
-    reason:
-        감사 로그 + WS 이벤트용 사유.
-
-    Returns
-    -------
-    {revived_from_state, new_start_stage}
+    현재 실행 중 task 가 있으면 취소. 잡 상태 RUNNING 으로 재설정 후
+    `_run_pipeline(start_stage=stage)` 새 task 생성.
     """
     async with _get_lock(job_id):
         spec = _jobs.get(job_id)
         if spec is None:
             raise WFPError(WFPErrorCode.JOB_NOT_FOUND, f"job {job_id} 없음")
-        if spec.state in (JobState.DONE, JobState.CANCELLED):
-            raise WFPError(
-                WFPErrorCode.INVALID_STATE,
-                f"revive 불가 (state={spec.state.value}) — DONE/CANCELLED 잡은 부활 안됨",
-            )
-        if start_stage < 2 or start_stage > 9:
-            raise WFPError(
-                WFPErrorCode.INVALID_STATE,
-                f"start_stage 는 2~9 사이여야 함 (요청: {start_stage})",
-            )
 
-        # 기존 task 가 살아있으면 정리 (보통 FAILED 면 이미 종료됨).
         await _cancel_running_task(job_id)
-
-        prev_state = spec.state.value
+        req = _job_reqs.get(job_id) or {}
         spec.state = JobState.RUNNING
+        spec.current_stage = stage - 1
         spec.error_code = ""
         spec.error_message = ""
-        spec.current_stage = start_stage - 1
         spec.finished_at = None
-
-        await _emit_ws(
-            job_id,
-            f"잡 부활 — Stage {start_stage} 부터 재실행 ({reason})",
-            {"revive": True, "from_state": prev_state, "to_stage": start_stage,
-             "reason": reason},
-        )
-
-        req = _job_reqs.get(job_id) or {}
-        new_task = asyncio.create_task(
-            _run_pipeline(spec, req, start_stage=start_stage)
-        )
+        new_task = asyncio.create_task(_run_pipeline(spec, req, start_stage=stage))
         _job_tasks[job_id] = new_task
-
-        log.info(
-            "job_revived",
-            extra={"job_id": job_id,
-                   "extra": {"from_state": prev_state,
-                             "start_stage": start_stage, "reason": reason}},
+        await _emit_ws(
+            job_id, f"Stage {stage} 부터 재시작",
+            {"stage": stage, "retry": True, "reason": reason},
         )
-        return {"revived_from_state": prev_state, "new_start_stage": start_stage}
+        log.info(
+            "job_retry_from_stage",
+            extra={"job_id": job_id, "extra": {"stage": stage, "reason": reason}},
+        )
+        return {"restarted_from_stage": stage}
 
 
 async def finalize_job(job_id: str, *, reason: str = "user") -> dict[str, Any]:

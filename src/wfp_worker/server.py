@@ -127,11 +127,19 @@ async def ws_progress(websocket: WebSocket, job_id: str) -> None:
     NOTE: WS는 헤더 인증이 복잡하므로 현재 인증 우회.
     운영에서는 `?token=...` query param 또는 첫 메시지 인증 권장.
     """
+    client = f"{websocket.client.host}:{websocket.client.port}" if websocket.client else "?"
+    log.info("ws_connect_attempt", extra={"job_id": job_id, "extra": {"client": client, "in_jobs": job_id in _jobs}})
     if job_id not in _jobs:
+        log.warning("ws_reject_unknown_job", extra={"job_id": job_id, "extra": {"known_jobs": len(_jobs)}})
         await websocket.close(code=4004)
         return
 
-    await websocket.accept()
+    try:
+        await websocket.accept()
+    except Exception as e:
+        log.exception("ws_accept_failed", extra={"job_id": job_id, "extra": {"err": str(e)}})
+        return
+    log.info("ws_accepted", extra={"job_id": job_id})
     _ws_clients.setdefault(job_id, []).append(websocket)
 
     try:

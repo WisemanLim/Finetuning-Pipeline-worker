@@ -61,7 +61,48 @@ def init_db() -> None:
 
     log.info("DB 초기화", extra={"extra": {"url": _DATABASE_URL.split("@")[-1]}})
     Base.metadata.create_all(bind=_engine)
+    _migrate_add_columns()
     ensure_supervisor()
+
+
+def _migrate_add_columns() -> None:
+    """경량 마이그레이션 — 신규 컬럼 누락 시 ALTER TABLE ADD COLUMN.
+
+    Alembic 미사용 시 schema drift 회피. SQLite + PostgreSQL 양립.
+    추가 컬럼 정의: (table, column, type, default_sql).
+    """
+    from sqlalchemy import text
+    additions = [
+        ("model_catalog", "source", "VARCHAR(16)", "'hf'"),
+        ("model_catalog", "is_public", "BOOLEAN", "0"),
+        ("model_catalog", "local_path", "VARCHAR(512)", "NULL"),
+        ("model_catalog", "owner_user_id", "VARCHAR(36)", "NULL"),
+    ]
+    with _engine.begin() as conn:
+        for table, col, col_type, default_sql in additions:
+            try:
+                if _DATABASE_URL.startswith("sqlite"):
+                    rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+                    existing = {r[1] for r in rows}
+                else:
+                    rows = conn.execute(text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = :t"
+                    ), {"t": table}).fetchall()
+                    existing = {r[0] for r in rows}
+                if col in existing:
+                    continue
+                default_clause = (
+                    f" DEFAULT {default_sql}" if default_sql and default_sql != "NULL" else ""
+                )
+                conn.execute(text(
+                    f"ALTER TABLE {table} ADD COLUMN {col} {col_type}{default_clause}"
+                ))
+                log.info("schema_migrate_add_column",
+                         extra={"extra": {"table": table, "col": col}})
+            except Exception as e:
+                log.warning("schema_migrate_failed",
+                            extra={"extra": {"table": table, "col": col, "err": str(e)}})
 
 
 def ensure_supervisor() -> None:

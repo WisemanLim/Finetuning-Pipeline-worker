@@ -127,9 +127,24 @@ class TrainConfigBuilder:
             output_dir=ckpt_dir,
         )
 
-        # 정밀도 설정 (양자화에 따라)
-        config.bf16 = quant in (Quantization.NONE,) and plan.backend != "cpu"
-        config.fp16 = not config.bf16 and plan.backend == "cuda"
+        # 정밀도 — BF16 지원 GPU 우선 (Ampere+/MPS). bf16/fp16 동시 활성 금지:
+        # GradScaler 는 BF16 grad 를 unscale 못 함 (_amp_foreach_non_finite_check_and_unscale_cuda
+        # not implemented for BFloat16). quant 무관 — QLoRA(bnb_4bit_compute_dtype=bfloat16) 도
+        # BF16 grad 사용이 표준.
+        if plan.backend == "cuda":
+            try:
+                import torch
+                bf16_ok = bool(torch.cuda.is_bf16_supported())
+            except Exception:
+                bf16_ok = False
+            config.bf16 = bf16_ok
+            config.fp16 = not bf16_ok
+        elif plan.backend == "mps":
+            config.bf16 = True
+            config.fp16 = False
+        else:
+            config.bf16 = False
+            config.fp16 = False
 
         # LoRA 설정 (LoRA/QLoRA 전략에서만)
         if strategy in (TrainStrategy.LORA, TrainStrategy.QLORA):

@@ -185,13 +185,14 @@ class PipelineTrainer:
                 stage=7,
             )
 
-        # 양자화 설정
+        # 양자화 설정 — compute_dtype 은 config.bf16/fp16 일관 (GradScaler 충돌 방지).
+        compute_dtype = torch.bfloat16 if config.bf16 else torch.float16
         bnb_config = None
         if config.quantization == Quantization.INT4:
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=compute_dtype,
                 bnb_4bit_use_double_quant=True,
             )
         elif config.quantization == Quantization.INT8:

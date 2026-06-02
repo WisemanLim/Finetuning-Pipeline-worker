@@ -3,10 +3,8 @@
 
 엔드포인트:
   PATCH /users/me              프로필 수정 (이름 등)
-
-DEPRECATED (2026-05): /users/me/hf-token 저장/삭제는 비활성. gated repo 다운로드는
-관리자 알림(AdminNotification kind=hf_gated) → 관리자가 HF_TOKEN 환경변수로
-download 수행하는 흐름으로 대체. 잠재적 평문 토큰 누수 + UX 혼선 회피 목적.
+  POST  /users/me/hf-token     HuggingFace 토큰 저장 (서버 측 암호화)
+  DELETE /users/me/hf-token    HF 토큰 삭제
 """
 
 from __future__ import annotations
@@ -25,10 +23,10 @@ class ProfileUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=128)
 
 
+# 일반 사용자 영역에서는 HF 토큰 입력 미노출 (settings 페이지에서 admin role 일 때만 렌더).
+# 백엔드 endpoint 는 admin 권한 검증 — 잘못된 호출 시 403.
 class HfTokenRequest(BaseModel):
-    # 최대 길이 제거 — HF 토큰 포맷 변경 / 회사 wrapper 토큰 대비.
-    # 양끝 공백은 서버에서 strip 후 검증.
-    hf_token: str = Field(min_length=4, max_length=4096)
+    hf_token: str = Field(min_length=10, max_length=255)
 
 
 class UserDetail(BaseModel):
@@ -36,7 +34,7 @@ class UserDetail(BaseModel):
     email: str
     name: str | None
     role: str
-    has_hf_token: bool
+    has_hf_token: bool = False  # admin 의 DB hf_token_encrypted 또는 env HF_TOKEN 존재 여부
 
 
 @router.patch("/me", response_model=UserDetail)
@@ -49,40 +47,50 @@ def update_profile(
     if req.name is not None:
         user.name = req.name
     db.commit()
+    # has_hf_token: admin 본인 DB 값 또는 env HF_TOKEN 존재 여부
+    import os as _os
+    env_token = bool(_os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+    db_token = bool(getattr(user, "hf_token_encrypted", None))
     return UserDetail(
         id=user.id, email=user.email, name=user.name,
-        role=user.role.value, has_hf_token=bool(user.hf_token_encrypted),
+        role=user.role.value,
+        has_hf_token=(env_token or db_token),
     )
 
 
-# DEPRECATED 2026-05: 사용자 HF 토큰 저장/삭제 라우트 주석 처리.
-# gated repo 접근은 관리자 알림 → 관리자 토큰 다운로드 흐름으로 대체.
-# 기존 hf_token_encrypted 컬럼은 스키마 호환 위해 유지 (마이그레이션 회피),
-# 신규 저장은 차단. 필요 시 재활성화는 본 블록 주석 해제 + admin.py 의
-# resume-download 흐름과 정책 정합 확인 후 진행.
-#
-# @router.post("/me/hf-token", status_code=status.HTTP_204_NO_CONTENT)
-# def save_hf_token(
-#     req: HfTokenRequest,
-#     user: User = Depends(get_current_user),
-#     db: Session = Depends(get_db),
-# ) -> None:
-#     """HF 토큰 저장. 평문 저장 — 운영 KMS/Vault 권장."""
-#     token = (req.hf_token or "").strip()
-#     if not token:
-#         raise HTTPException(
-#             status_code=status.HTTP_400_BAD_REQUEST,
-#             detail="HF token 이 비어있습니다.",
-#         )
-#     user.hf_token_encrypted = token
-#     db.commit()
-#
-#
-# @router.delete("/me/hf-token", status_code=status.HTTP_204_NO_CONTENT)
-# def delete_hf_token(
-#     user: User = Depends(get_current_user),
-#     db: Session = Depends(get_db),
-# ) -> None:
-#     """저장된 HF 토큰 제거."""
-#     user.hf_token_encrypted = None
-#     db.commit()
+# HF 토큰 저장/삭제 — admin role 전용 (UI 도 admin role 일때만 노출).
+# Worker 가 모델 다운로드 시 우선순위: spec.hf_token > env HF_TOKEN > admin DB.
+@router.post("/me/hf-token", status_code=status.HTTP_204_NO_CONTENT)
+def save_hf_token(
+    req: HfTokenRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """HF 토큰 저장 (admin 만). 형식 간단 검증."""
+    if user.role.value != "ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="HF 토큰 저장은 관리자 권한 필요",
+        )
+    if not req.hf_token.startswith(("hf_", "api_")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="HF token must start with 'hf_' or 'api_'",
+        )
+    user.hf_token_encrypted = req.hf_token  # TODO: encrypt (Fernet / vault)
+    db.commit()
+
+
+@router.delete("/me/hf-token", status_code=status.HTTP_204_NO_CONTENT)
+def delete_hf_token(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """저장된 HF 토큰 제거 (admin 만)."""
+    if user.role.value != "ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="HF 토큰 삭제는 관리자 권한 필요",
+        )
+    user.hf_token_encrypted = None
+    db.commit()

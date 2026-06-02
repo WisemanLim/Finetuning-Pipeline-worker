@@ -224,7 +224,7 @@ class ModelDownloader:
                     stage=4,
                     detail=(
                         f"관리자가 https://huggingface.co/{repo_id} 방문 → Access repository "
-                        f"클릭 → 라이선스 form 제출 → 승인 후 /admin/jobs/{{job_id}}/resume-download "
+                        f"클릭 → 라이선스 form 제출 → 승인 후 /admin/jobs/{{job_id}}/model-download "
                         f"호출. 일부 모델은 자동 승인, 일부는 수동 review."
                     ),
                 ) from e

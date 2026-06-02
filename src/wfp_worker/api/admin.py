@@ -36,8 +36,9 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -339,7 +340,13 @@ class CatalogItem(BaseModel):
     language: list[str]
     tags: list[str]
     priority: int
-    is_active: bool
+    is_active: bool  # False = HF 사용불가(미지원/삭제) 마킹
+    downloaded: bool = False        # 로컬 HF cache 또는 local_path 존재
+    downloading: bool = False       # 백그라운드 다운로드 진행 중
+    source: str = "hf"              # "hf" / "finetuned" / "upload"
+    is_public: bool = False         # source!="hf" 일 때 공개 여부
+    local_path: str | None = None   # finetuned/upload 의 로컬 경로
+    owner_user_id: str | None = None
 
 
 class CatalogCreate(BaseModel):
@@ -350,6 +357,8 @@ class CatalogCreate(BaseModel):
     language: list[str] = ["ko", "en"]
     tags: list[str] = ["general"]
     priority: int = 5
+    source: str = "hf"               # "hf" / "upload"
+    local_path: str | None = None    # upload 시 서버 경로
 
 
 class CatalogPatch(BaseModel):
@@ -360,15 +369,48 @@ class CatalogPatch(BaseModel):
     tags: list[str] | None = None
     priority: int | None = None
     is_active: bool | None = None
+    is_public: bool | None = None
+
+
+# 백그라운드 다운로드 추적 — repo_id → {started_at, error}
+_catalog_downloading: dict[str, dict] = {}
+
+
+def _is_model_downloaded(repo_id: str, local_path: str | None = None) -> bool:
+    """다운로드 완료 여부.
+
+    - source=hf: HF cache 에 config.json 존재
+    - source=finetuned/upload: local_path 디렉토리 존재
+    """
+    if local_path:
+        try:
+            from pathlib import Path as _P
+            return _P(local_path).exists()
+        except Exception:
+            return False
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        path = try_to_load_from_cache(repo_id, "config.json")
+        return bool(path)
+    except Exception:
+        return False
 
 
 def _to_catalog_item(e: ModelCatalogEntry) -> CatalogItem:
+    source = getattr(e, "source", "hf") or "hf"
+    local_path = getattr(e, "local_path", None)
     return CatalogItem(
         id=e.id, hf_repo=e.hf_repo, params_b=e.params_b, license=e.license,
         hw_min_vram_gb=e.hw_min_vram_gb,
         language=[s.strip() for s in e.language.split(",") if s.strip()],
         tags=[s.strip() for s in e.tags.split(",") if s.strip()],
         priority=e.priority, is_active=e.is_active,
+        downloaded=_is_model_downloaded(e.hf_repo, local_path if source != "hf" else None),
+        downloading=(e.hf_repo in _catalog_downloading),
+        source=source,
+        is_public=bool(getattr(e, "is_public", False)),
+        local_path=local_path,
+        owner_user_id=getattr(e, "owner_user_id", None),
     )
 
 
@@ -389,15 +431,20 @@ def create_catalog(
 ) -> CatalogItem:
     if db.query(ModelCatalogEntry).filter(ModelCatalogEntry.hf_repo == req.hf_repo).first():
         raise HTTPException(status_code=409, detail="Already exists")
+    src = req.source if req.source in ("hf", "upload", "finetuned") else "hf"
     entry = ModelCatalogEntry(
         hf_repo=req.hf_repo, params_b=req.params_b, license=req.license,
         hw_min_vram_gb=req.hw_min_vram_gb,
         language=",".join(req.language), tags=",".join(req.tags), priority=req.priority,
+        source=src,
+        is_public=(src == "hf"),  # HF 는 공개 의미 없음, finetuned/upload 는 비공개 기본
+        local_path=req.local_path,
+        owner_user_id=actor.id if src in ("upload", "finetuned") else None,
     )
     db.add(entry)
     db.commit()
     db.refresh(entry)
-    _audit(db, actor, "catalog_create", target=entry.id, detail=req.hf_repo)
+    _audit(db, actor, "catalog_create", target=entry.id, detail=f"{src}:{req.hf_repo}")
     return _to_catalog_item(entry)
 
 
@@ -1126,196 +1173,6 @@ def auto_refresh_catalog(
 
 
 # ─────────────────────────────────────────
-# HF gated repo 사전 점검 + 관리자 트리거 모델 다운로드
-# ─────────────────────────────────────────
-
-
-class HfAccessCheckResult(BaseModel):
-    repo: str
-    status: str                # "ok" | "gated" | "no_token" | "not_found" | "error"
-    detail: str = ""
-    instructions: list[str] = []
-
-
-def _load_admin_hf_token() -> str | None:
-    """관리자 호스트의 HF 토큰 — env HF_TOKEN / HUGGING_FACE_HUB_TOKEN /
-    ~/.cache/huggingface/token 순.
-    """
-    import os
-    from pathlib import Path
-    token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
-    if token:
-        return token
-    path = Path.home() / ".cache" / "huggingface" / "token"
-    if path.exists():
-        return path.read_text().strip() or None
-    return None
-
-
-def _gated_instructions(repo: str, job_id: str | None = None) -> list[str]:
-    return [
-        f"https://huggingface.co/{repo} 방문 (관리자 HF 계정 로그인)",
-        "Access repository 버튼 클릭",
-        "라이선스 동의 form 제출",
-        "승인 대기 (Gemma 등은 즉시 / 일부 모델은 수동 review)",
-        (f"승인 후 POST /admin/jobs/{job_id}/resume-download 호출"
-         if job_id else "승인 후 POST /admin/jobs/{job_id}/resume-download 또는 "
-                        "POST /admin/hf/download 호출"),
-    ]
-
-
-@router.get("/hf/check-access", response_model=HfAccessCheckResult)
-def hf_check_access(
-    repo: str,
-    _: User = Depends(get_current_admin),
-) -> HfAccessCheckResult:
-    """관리자 HF 토큰으로 repo 접근 가능 여부 사전 점검.
-
-    HfApi.model_info 호출 시 status:
-      - 200 → ok
-      - 401 → no_token (토큰 자체 무효)
-      - 403 → gated (라이선스 동의 + 승인 필요)
-      - 404 → not_found
-    """
-    repo = (repo or "").strip()
-    if not repo:
-        raise HTTPException(status_code=400, detail="repo 파라미터 필요")
-    token = _load_admin_hf_token()
-    if not token:
-        return HfAccessCheckResult(
-            repo=repo, status="no_token",
-            detail="관리자 호스트의 HF_TOKEN 환경변수 또는 ~/.cache/huggingface/token 미설정.",
-        )
-    try:
-        from huggingface_hub import HfApi
-        from huggingface_hub.utils import HfHubHTTPError
-    except ImportError as e:
-        raise HTTPException(status_code=503, detail="huggingface_hub 미설치") from e
-    try:
-        HfApi(token=token).model_info(repo_id=repo)
-    except HfHubHTTPError as e:
-        sc = getattr(getattr(e, "response", None), "status_code", None)
-        if sc == 403:
-            return HfAccessCheckResult(
-                repo=repo, status="gated",
-                detail="403 — gated repo. 라이선스 동의 + 승인 필요.",
-                instructions=_gated_instructions(repo),
-            )
-        if sc == 401:
-            return HfAccessCheckResult(
-                repo=repo, status="no_token",
-                detail="401 — 토큰 무효. 관리자 HF_TOKEN 재발급 필요.",
-            )
-        if sc == 404:
-            return HfAccessCheckResult(
-                repo=repo, status="not_found",
-                detail=f"404 — repo {repo} 존재하지 않거나 비공개.",
-            )
-        return HfAccessCheckResult(repo=repo, status="error", detail=str(e))
-    except Exception as e:
-        return HfAccessCheckResult(repo=repo, status="error", detail=str(e))
-    return HfAccessCheckResult(repo=repo, status="ok", detail="접근 가능 — 다운로드 가능 상태.")
-
-
-class ResumeDownloadResult(BaseModel):
-    job_id: str
-    repo: str
-    pre_check: HfAccessCheckResult
-    download_started: bool
-    revived_from_state: str | None = None
-    new_start_stage: int | None = None
-    detail: str = ""
-
-
-@router.post("/jobs/{job_id}/resume-download", response_model=ResumeDownloadResult)
-async def admin_resume_download(
-    job_id: str,
-    db: Session = Depends(get_db),
-    actor: User = Depends(get_current_admin),
-) -> ResumeDownloadResult:
-    """gated repo 차단으로 멈춘 잡의 모델을 관리자 토큰으로 다운로드 + 잡 부활.
-
-    흐름:
-      1. 사전 점검 (hf_check_access 동일 로직) — status != ok 면 다운로드 안하고 안내만 반환.
-      2. 다운로드 — ModelDownloader 가 spec.hf_token 비어있으면 env HF_TOKEN 자동 fallback.
-         progress 콜백으로 잡 WS 에 진행도 발행.
-      3. 잡 부활 — Stage 5 부터 재실행. 관련 AdminNotification 들 status=resolved.
-
-    Pre-condition: 사용자가 huggingface.co/<repo> 에서 라이선스 동의 + 승인 완료 상태.
-    승인 안된 상태에서 호출하면 pre_check.status=gated 로 안내 반환 후 종료.
-    """
-    from wfp_worker.runtime import _jobs, revive_job_from_stage
-    from wfp_worker.stage4_model import ModelDownloader
-
-    spec = _jobs.get(job_id)
-    if not spec:
-        raise HTTPException(status_code=404, detail="Job not found")
-    repo = spec.model_hf_repo
-    if not repo:
-        raise HTTPException(status_code=400, detail="잡에 model_hf_repo 설정 없음")
-
-    # 1. 사전 점검
-    pre = hf_check_access(repo=repo, _=actor)  # type: ignore[arg-type]
-    if pre.status != "ok":
-        _audit(db, actor, "admin_resume_download_blocked",
-               target=job_id, detail=f"repo={repo} status={pre.status}")
-        return ResumeDownloadResult(
-            job_id=job_id, repo=repo, pre_check=pre,
-            download_started=False,
-            detail=f"사전 점검 실패 ({pre.status}) — 라이선스 동의/승인 완료 후 재호출.",
-        )
-
-    # 2. 다운로드 — 캐시 hit 면 거의 즉시, miss 면 동기 다운로드.
-    #    progress 발행은 다음 단계의 revive (_run_pipeline) 가 Stage 5 부터 재실행하며
-    #    WS 이벤트로 흘려보낸다. 다운로드 자체는 admin endpoint 응답 흐름에서 동기 수행.
-    try:
-        # admin token 강제: spec.hf_token 우선이라 비워두면 _load_token 이 env 폴백.
-        spec.hf_token = ""
-        # 캐시 hit 면 즉시 종료, miss 면 동기 다운로드.
-        ModelDownloader().download(spec)
-    except Exception as e:
-        _audit(db, actor, "admin_resume_download_failed",
-               target=job_id, detail=f"repo={repo} err={e}")
-        raise HTTPException(status_code=502, detail=f"다운로드 실패: {e}") from e
-
-    # 3. 관련 AdminNotification resolve
-    notifs = (
-        db.query(AdminNotification)
-        .filter(
-            AdminNotification.job_id == job_id,
-            AdminNotification.kind == "hf_gated",
-            AdminNotification.status != "resolved",
-        )
-        .all()
-    )
-    for n in notifs:
-        n.status = "resolved"
-        n.resolved_at = datetime.now(timezone.utc)
-        n.resolved_by = actor.id
-    db.commit()
-
-    # 4. 잡 부활 — Stage 5 부터 (모델 다운로드 완료, Stage 4 재실행 불필요).
-    from wfp_worker.common.errors import WFPError
-    try:
-        revived = await revive_job_from_stage(job_id, 5, reason=f"admin:{actor.id}")
-    except WFPError as e:
-        _audit(db, actor, "admin_resume_download_revive_failed",
-               target=job_id, detail=e.to_dict()["title"])
-        raise HTTPException(status_code=409, detail=e.to_dict()) from e
-
-    _audit(db, actor, "admin_resume_download",
-           target=job_id, detail=f"repo={repo} notifs_resolved={len(notifs)}")
-
-    return ResumeDownloadResult(
-        job_id=job_id, repo=repo, pre_check=pre,
-        download_started=True,
-        revived_from_state=revived.get("revived_from_state"),
-        new_start_stage=revived.get("new_start_stage"),
-        detail=f"다운로드 완료 + 잡 부활 (Stage {revived.get('new_start_stage')} 부터).",
-    )
-
-
-# ─────────────────────────────────────────
 # HF Hub 검색 — 카탈로그 추가 시 자동완성 보조 (PRD §10.4 모델 갱신)
 # ─────────────────────────────────────────
 
@@ -1412,3 +1269,428 @@ def hf_search(
 
     _hf_cache[cache_key] = (now, results)
     return results
+
+
+# ─────────────────────────────────────────
+# 모델 다운로드 승인 (HF 토큰 / 라이선스 사전 검증 + 재시작)
+# ─────────────────────────────────────────
+
+
+class ModelDownloadResult(BaseModel):
+    repo_id: str
+    accessible: bool
+    status: str   # ok / gated / token_invalid / not_found / error
+    detail: str = ""
+    hf_url: str = ""
+    job_restarted: bool = False
+
+
+def _hf_preflight(repo_id: str, token: str | None) -> tuple[bool, str, str]:
+    """HF 모델 액세스 사전 검증. (accessible, status_code, detail) 반환.
+
+    상태:
+      ok            — 토큰 유효 + 라이선스 동의 완료 (다운로드 가능)
+      token_invalid — HF_TOKEN 자체 무효 (401)
+      gated         — 라이선스 미동의 (403, gated repo)
+      not_found     — 리포 미존재 (404)
+      error         — 기타 (네트워크 등)
+    """
+    try:
+        from huggingface_hub import HfApi
+        HfApi().model_info(repo_id, token=token)
+        return True, "ok", "모델 접근 가능 — 다운로드 시작"
+    except Exception as e:
+        msg = str(e).lower()
+        if "401" in msg or "unauthorized" in msg or ("invalid" in msg and "token" in msg):
+            return False, "token_invalid", (
+                "HF_TOKEN 환경 변수가 유효하지 않음. docker/.env 의 HF_TOKEN 갱신 후 "
+                "worker 재시작 (make restart)."
+            )
+        if "403" in msg or "gated" in msg or "restricted" in msg or "authorized list" in msg:
+            return False, "gated", (
+                f"라이선스 미동의. https://huggingface.co/{repo_id} 방문 "
+                "(HF_TOKEN 발급 계정으로 로그인) → Access repository → 라이선스 동의 "
+                "→ 승인 대기 → 본 명령 재시도."
+            )
+        if "404" in msg or "not found" in msg or "repository not found" in msg:
+            return False, "not_found", f"리포 미존재: {repo_id}"
+        return False, "error", str(e)[:300]
+
+
+@router.post("/jobs/{job_id}/model-download", response_model=ModelDownloadResult)
+async def admin_model_download(
+    job_id: str,
+    admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+) -> ModelDownloadResult:
+    """관리자가 admin notification 의 모델 다운로드 요청을 처리.
+
+    흐름:
+      1. job 의 model_hf_repo 추출
+      2. HF_TOKEN (env) 으로 사전 검증
+         - ok       → Stage 4 부터 파이프라인 재시작
+         - gated    → 라이선스 동의 URL 안내 (관리자가 HF 웹 절차 수행 후 재호출)
+         - token_invalid / not_found / error → 메시지 반환, 재시작 안 함
+    """
+    import asyncio as _asyncio
+
+    spec = _jobs.get(job_id)
+    if spec is None:
+        raise HTTPException(status_code=404, detail="잡 인메모리 없음 — worker 재시작됐을 수 있음")
+    repo_id = (spec.model_hf_repo or "").strip()
+    if not repo_id:
+        raise HTTPException(status_code=400, detail="잡에 model_hf_repo 미지정")
+
+    hf_url = f"https://huggingface.co/{repo_id}"
+    admin_token = _resolve_admin_hf_token(admin)
+    if not admin_token:
+        _audit(db, admin, "model_download_request", target=job_id,
+               detail=f"token_missing: {repo_id}")
+        return ModelDownloadResult(
+            repo_id=repo_id,
+            accessible=False,
+            status="token_missing",
+            detail=(
+                "HF 토큰 미설정. docker/.env 의 HF_TOKEN 설정 후 worker 재시작, "
+                "또는 관리자 설정 화면에서 HF Token 저장 후 재시도."
+            ),
+            hf_url=hf_url,
+            job_restarted=False,
+        )
+
+    accessible, s_status, detail = await _asyncio.to_thread(_hf_preflight, repo_id, admin_token)
+
+    # HF 미지원 → 카탈로그 사용불가 마킹
+    if s_status == "not_found":
+        try:
+            entry = db.query(ModelCatalogEntry).filter(
+                ModelCatalogEntry.hf_repo == repo_id,
+            ).first()
+            if entry:
+                entry.is_active = False
+                db.commit()
+                detail = detail + " 카탈로그를 '사용불가' 로 변경했습니다."
+        except Exception as e:
+            log.warning("catalog_mark_unavailable_failed",
+                        extra={"extra": {"err": str(e)}})
+
+    job_restarted = False
+    if accessible:
+        # admin_token 을 잡 컨텍스트에 주입 (model_downloader._load_token 우선 사용).
+        # exclude=True 라 jobs_state.json 영속화 안 됨.
+        spec.hf_token = admin_token
+        from wfp_worker.runtime import retry_from_stage
+        try:
+            await retry_from_stage(job_id, 4, reason=f"admin:{admin.email}")
+            job_restarted = True
+        except Exception as e:
+            log.warning("retry_from_stage_failed",
+                        extra={"job_id": job_id, "extra": {"err": str(e)}})
+            accessible = False
+            s_status = "error"
+            detail = f"재시작 실패: {e}"
+
+        # 관련 notification 해소 마킹
+        try:
+            from wfp_worker.db import AdminNotification
+            rows = db.query(AdminNotification).filter(
+                AdminNotification.job_id == job_id,
+                AdminNotification.kind == "model_download",
+                AdminNotification.status == "new",
+            ).all()
+            for r in rows:
+                r.status = "resolved"
+                r.resolved_at = datetime.now(timezone.utc)
+                r.resolved_by = admin.id
+            db.commit()
+        except Exception as e:
+            log.warning("notification_resolve_failed",
+                        extra={"extra": {"err": str(e)}})
+
+    _audit(db, admin, "model_download_request", target=job_id,
+           detail=f"{s_status}: {repo_id}")
+
+    return ModelDownloadResult(
+        repo_id=repo_id,
+        accessible=accessible,
+        status=s_status,
+        detail=detail,
+        hf_url=hf_url,
+        job_restarted=job_restarted,
+    )
+
+
+# ─────────────────────────────────────────
+# 카탈로그 모델 다운로드 (admin 트리거)
+# ─────────────────────────────────────────
+
+
+class EnvHfTokenStatus(BaseModel):
+    has_env_token: bool   # docker/.env 의 HF_TOKEN 설정 여부
+    has_admin_db_token: bool   # 현재 admin 의 DB hf_token_encrypted 설정 여부
+    effective_source: str   # "env" / "admin_db" / "none"
+
+
+@router.get("/env/hf-token-status", response_model=EnvHfTokenStatus)
+def env_hf_token_status(
+    admin: User = Depends(get_current_admin),
+) -> EnvHfTokenStatus:
+    """HF 토큰 가용 경로 확인. Frontend 가 다운로드 가능 여부 판정에 사용."""
+    import os as _os
+    has_env = bool(_os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+    has_db = bool(getattr(admin, "hf_token_encrypted", None))
+    if has_env:
+        src = "env"
+    elif has_db:
+        src = "admin_db"
+    else:
+        src = "none"
+    return EnvHfTokenStatus(has_env_token=has_env, has_admin_db_token=has_db, effective_source=src)
+
+
+def _resolve_admin_hf_token(admin: User) -> str | None:
+    """Admin 컨텍스트에서 사용할 HF 토큰. env > admin DB > None."""
+    import os as _os
+    return (
+        _os.environ.get("HF_TOKEN")
+        or _os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or getattr(admin, "hf_token_encrypted", None)
+        or None
+    )
+
+
+class CatalogDownloadResult(BaseModel):
+    hf_repo: str
+    status: str   # ok / gated / token_invalid / token_missing / not_found / already_downloaded / downloading / error
+    detail: str = ""
+    hf_url: str = ""
+
+
+def _do_catalog_download(repo_id: str, token: str | None) -> None:
+    """백그라운드 다운로드 worker. 완료 시 _catalog_downloading 에서 제거."""
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(
+            repo_id=repo_id,
+            token=token,
+            ignore_patterns=["*.msgpack", "*.h5", "flax_model*", "tf_model*"],
+        )
+        log.info("catalog_download_done", extra={"extra": {"repo": repo_id}})
+    except Exception as e:
+        log.warning("catalog_download_failed",
+                    extra={"extra": {"repo": repo_id, "err": str(e)[:200]}})
+        _catalog_downloading[repo_id] = {**_catalog_downloading.get(repo_id, {}), "error": str(e)[:300]}
+        return
+    finally:
+        _catalog_downloading.pop(repo_id, None)
+
+
+@router.post("/catalog/models/{entry_id}/download", response_model=CatalogDownloadResult)
+async def catalog_download(
+    entry_id: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+) -> CatalogDownloadResult:
+    """카탈로그 모델 다운로드 트리거. HF pre-flight → 백그라운드 다운로드 시작.
+
+    HF 측이 모델을 미지원(404)으로 응답하면 catalog.is_active=False 마킹 → '사용불가'.
+    """
+    import asyncio as _asyncio
+    entry = db.get(ModelCatalogEntry, entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    repo_id = entry.hf_repo
+    hf_url = f"https://huggingface.co/{repo_id}"
+
+    # 이미 cache 에 있으면 skip
+    if _is_model_downloaded(repo_id):
+        return CatalogDownloadResult(
+            hf_repo=repo_id, status="already_downloaded",
+            detail="이미 로컬 HF cache 에 존재", hf_url=hf_url,
+        )
+
+    # 진행 중 중복 방지
+    if repo_id in _catalog_downloading:
+        return CatalogDownloadResult(
+            hf_repo=repo_id, status="downloading",
+            detail="이미 다운로드 진행 중", hf_url=hf_url,
+        )
+
+    token = _resolve_admin_hf_token(admin)
+    if not token:
+        return CatalogDownloadResult(
+            hf_repo=repo_id, status="token_missing",
+            detail=(
+                "HF 토큰 미설정. docker/.env 의 HF_TOKEN 설정 후 worker 재시작, "
+                "또는 관리자 설정 화면에서 HF Token 저장."
+            ),
+            hf_url=hf_url,
+        )
+
+    accessible, s_status, detail = await _asyncio.to_thread(_hf_preflight, repo_id, token)
+
+    if s_status == "not_found":
+        # HF 미지원 — 카탈로그에서 사용불가 마킹
+        entry.is_active = False
+        db.commit()
+        _audit(db, admin, "catalog_mark_unavailable", target=entry_id, detail=repo_id)
+        return CatalogDownloadResult(
+            hf_repo=repo_id, status="not_found",
+            detail=detail + " 카탈로그를 '사용불가' 로 변경했습니다.",
+            hf_url=hf_url,
+        )
+
+    if not accessible:
+        return CatalogDownloadResult(
+            hf_repo=repo_id, status=s_status, detail=detail, hf_url=hf_url,
+        )
+
+    # 백그라운드 다운로드 시작
+    import time as _time
+    _catalog_downloading[repo_id] = {"started_at": _time.time(), "error": None}
+    _asyncio.create_task(_asyncio.to_thread(_do_catalog_download, repo_id, token))
+    _audit(db, admin, "catalog_download_start", target=entry_id, detail=repo_id)
+
+    return CatalogDownloadResult(
+        hf_repo=repo_id, status="ok",
+        detail="다운로드 시작 — 카탈로그 새로고침으로 진행 확인",
+        hf_url=hf_url,
+    )
+
+
+# ─────────────────────────────────────────
+# 카탈로그 공개/비공개 토글 + 사용자 모델 파일 업로드
+# ─────────────────────────────────────────
+
+
+class TogglePublicResult(BaseModel):
+    id: str
+    hf_repo: str
+    source: str
+    is_public: bool
+
+
+@router.post("/catalog/models/{entry_id}/toggle-public", response_model=TogglePublicResult)
+def catalog_toggle_public(
+    entry_id: str,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> TogglePublicResult:
+    """사용자(비공개)↔(공개) 토글. source='hf' 항목에는 의미 없음."""
+    entry = db.get(ModelCatalogEntry, entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Not found")
+    src = getattr(entry, "source", "hf") or "hf"
+    if src == "hf":
+        raise HTTPException(
+            status_code=400,
+            detail="HF 공식 모델은 공개/비공개 토글 불가 (source='hf')",
+        )
+    entry.is_public = not bool(getattr(entry, "is_public", False))
+    db.commit()
+    _audit(db, actor, "catalog_toggle_public", target=entry_id,
+           detail=f"is_public={entry.is_public}")
+    return TogglePublicResult(
+        id=entry.id, hf_repo=entry.hf_repo, source=src,
+        is_public=bool(entry.is_public),
+    )
+
+
+# 업로드 모델 저장 루트 — ~/.wfp/uploads/<entry_id>/
+_UPLOAD_ROOT = Path.home() / ".wfp" / "uploads"
+
+
+@router.post("/catalog/models/upload", response_model=CatalogItem, status_code=status.HTTP_201_CREATED)
+async def catalog_upload_model(
+    hf_repo: str = Form(...),
+    params_b: float = Form(...),
+    license: str = Form("custom"),
+    hw_min_vram_gb: float = Form(0.0),
+    language: str = Form("ko,en"),
+    tags: str = Form("upload"),
+    priority: int = Form(50),
+    is_public: bool = Form(False),
+    files: list[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_admin),
+) -> CatalogItem:
+    """사용자 모델 파일 업로드 + 카탈로그 등록.
+
+    multipart/form-data — 한 모델당 다수 파일 (config.json, *.safetensors, tokenizer.* 등).
+    저장 경로: ~/.wfp/uploads/<entry_id>/
+    hf_repo 식별: 충돌 방지 위해 'upload://' 접두 강제 (사용자 자유 입력시).
+    """
+    import uuid as _uuid
+
+    # 입력 정리
+    repo = hf_repo.strip()
+    if not repo:
+        raise HTTPException(status_code=400, detail="hf_repo 필수")
+    if not repo.startswith("upload://"):
+        repo = f"upload://{repo.lstrip('/')}"
+
+    if db.query(ModelCatalogEntry).filter(ModelCatalogEntry.hf_repo == repo).first():
+        raise HTTPException(status_code=409, detail=f"Already exists: {repo}")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="파일 1 개 이상 필요")
+
+    entry_id = str(_uuid.uuid4())
+    dest_dir = _UPLOAD_ROOT / entry_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # 파일 저장 (chunked)
+    saved = []
+    total_bytes = 0
+    for uf in files:
+        if not uf.filename:
+            continue
+        # path traversal 차단
+        safe_name = uf.filename.replace("..", "_").replace("/", "_").replace("\\", "_")
+        path = dest_dir / safe_name
+        size = 0
+        with path.open("wb") as fp:
+            while True:
+                chunk = await uf.read(1024 * 1024)
+                if not chunk:
+                    break
+                fp.write(chunk)
+                size += len(chunk)
+        saved.append({"name": safe_name, "size": size})
+        total_bytes += size
+
+    if not saved:
+        # 빈 업로드 — 디렉토리 정리
+        try:
+            import shutil as _sh
+            _sh.rmtree(dest_dir, ignore_errors=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="유효한 파일 없음")
+
+    entry = ModelCatalogEntry(
+        id=entry_id,
+        hf_repo=repo,
+        params_b=params_b,
+        license=license,
+        hw_min_vram_gb=hw_min_vram_gb,
+        language=language,
+        tags=tags,
+        priority=priority,
+        is_active=True,
+        source="upload",
+        is_public=is_public,
+        local_path=str(dest_dir),
+        owner_user_id=actor.id,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    _audit(db, actor, "catalog_upload", target=entry.id,
+           detail=f"{repo} files={len(saved)} bytes={total_bytes}")
+    log.info("catalog_upload_done",
+             extra={"extra": {"id": entry.id, "files": len(saved), "bytes": total_bytes}})
+
+    return _to_catalog_item(entry)
