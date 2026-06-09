@@ -88,6 +88,9 @@ class ModelCatalogEntry(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # 출처 — "hf" (HF 공식) / "finetuned" (Stage 9 자동등록) / "upload" (사용자 파일)
     source: Mapped[str] = mapped_column(String(16), default="hf", nullable=False)
+    # 모델 포맷 — safetensors / gguf / mlx / pytorch / onnx / other.
+    # safetensors(+HF) 만 파인튜닝 베이스로 사용 가능, 그 외는 추론/배포 전용.
+    model_format: Mapped[str] = mapped_column(String(16), default="safetensors", nullable=False)
     # 사용자 모델 공개 여부 (source!="hf" 일 때만 의미)
     is_public: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # 로컬 경로 — finetuned 체크포인트 / upload 디렉토리

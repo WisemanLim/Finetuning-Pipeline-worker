@@ -272,12 +272,15 @@ class PipelineTrainer:
 
         # JSONL 형식 데이터 로드
         train_file = str(Path(dataset_path) / "train.jsonl")
-        val_file = str(Path(dataset_path) / "val.jsonl")
+        val_path = Path(dataset_path) / "val.jsonl"
 
-        dataset = load_dataset(
-            "json",
-            data_files={"train": train_file, "validation": val_file},
-        )
+        # val.jsonl이 비어있으면(소규모 데이터셋) validation split 생략 — 빈 split은
+        # load_dataset에서 'Instruction "validation" corresponds to no data!' 크래시 유발.
+        has_val = val_path.exists() and val_path.stat().st_size > 0
+        data_files = {"train": train_file}
+        if has_val:
+            data_files["validation"] = str(val_path)
+        dataset = load_dataset("json", data_files=data_files)
 
         # TRL >=0.12 호환: 'text' 컬럼 강제 생성 — instruction/input/output → 단일 학습 텍스트.
         # 옛 SFTTrainer는 dataset_text_field 인자로 처리. 신 버전은 'text' 컬럼 자체를 기대.
@@ -309,9 +312,12 @@ class PipelineTrainer:
             logging_steps=config.logging_steps,
             fp16=config.fp16,
             bf16=config.bf16,
-            eval_strategy="steps",   # transformers >=4.41 (옛 evaluation_strategy 제거됨)
+            # val 없으면 eval/best-model 비활성.
+            # eval_strategy=steps + load_best는 eval_dataset 필수.
+            # 소규모 val 생략 시 ValueError 방지.
+            eval_strategy="steps" if has_val else "no",   # transformers >=4.41 (옛 evaluation_strategy 제거됨)
             save_strategy="steps",
-            load_best_model_at_end=True,
+            load_best_model_at_end=has_val,
             report_to=["tensorboard"],
         )
 
@@ -375,9 +381,20 @@ class PipelineTrainer:
                 if not logs:
                     return
                 total = max(state.max_steps, 1)
+                # transformers 는 스텝별 로그엔 'loss', 학습 종료 요약엔 'train_loss'
+                # 키를 쓴다. 둘 다 잡아 손실 이벤트로 발행(둘 중 하나라도 있으면).
+                loss = logs.get("loss")
+                if loss is None:
+                    loss = logs.get("train_loss")
+                eval_loss = logs.get("eval_loss")
+                # 최신 train_loss 를 spec 에 실시간 반영(REST 폴링으로도 노출).
+                if loss is not None:
+                    spec.train_loss = loss
+                if eval_loss is not None:
+                    spec.eval_loss = eval_loss
                 cb(str(spec.job_id), 7,
                    f"Step {state.global_step}/{total}",
-                   {"loss": logs.get("loss"), "eval_loss": logs.get("eval_loss"),
+                   {"loss": loss, "eval_loss": eval_loss,
                     "step": state.global_step, "total_steps": total,
                     "epoch": logs.get("epoch"),
                     "stage_progress": state.global_step / total})

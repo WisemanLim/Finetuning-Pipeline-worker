@@ -80,8 +80,21 @@ class ArtifactKind(str, Enum):
     ADAPTER = "adapter"        # LoRA adapter_model.safetensors
     MERGED = "merged"          # 머지된 full weights
     GGUF = "gguf"              # llama.cpp GGUF 포맷
+    MLX = "mlx"                # Apple MLX 디렉토리 (npz)
+    PYTORCH = "pytorch"        # PyTorch .bin state_dict
+    ONNX = "onnx"              # ONNX export
     ZIP = "zip"                # 패키지 ZIP
     MODEL_CARD = "model_card"  # model_card.md
+
+
+# 파인튜닝 완료 후 on-demand 변환 가능한 포맷 (어댑터/모델카드/zip 제외).
+CONVERTIBLE_KINDS: tuple[ArtifactKind, ...] = (
+    ArtifactKind.MERGED,
+    ArtifactKind.GGUF,
+    ArtifactKind.MLX,
+    ArtifactKind.PYTORCH,
+    ArtifactKind.ONNX,
+)
 
 
 # ─────────────────────────────────────────

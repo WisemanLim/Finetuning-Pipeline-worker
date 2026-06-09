@@ -68,6 +68,15 @@ train_gpu = [
     "wfp-worker[train]",
     "bitsandbytes>=0.43",
 ]
+convert = [
+    # 파인튜닝 완료 모델 포맷 변환 (gguf/mlx/pytorch/onnx).
+    # gguf 는 llama.cpp(별도 클론) 필요 — make install-convert-tools 참고.
+    "wfp-worker[train]",
+    "onnx>=1.16",
+    "optimum[exporters]>=1.20",
+    # MLX 는 Apple Silicon 전용
+    "mlx-lm>=0.18; platform_system == 'Darwin'",
+]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",

@@ -74,6 +74,7 @@ def _migrate_add_columns() -> None:
     from sqlalchemy import text
     additions = [
         ("model_catalog", "source", "VARCHAR(16)", "'hf'"),
+        ("model_catalog", "model_format", "VARCHAR(16)", "'safetensors'"),
         ("model_catalog", "is_public", "BOOLEAN", "0"),
         ("model_catalog", "local_path", "VARCHAR(512)", "NULL"),
         ("model_catalog", "owner_user_id", "VARCHAR(36)", "NULL"),

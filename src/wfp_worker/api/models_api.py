@@ -52,9 +52,14 @@ def list_models(
         from wfp_worker.stage4_model.model_catalog import ModelEntry
 
         catalog = ModelCatalog()
-        # 데이터베이스 항목을 ModelEntry 형태로 변환하여 필터
+        # 데이터베이스 항목을 ModelEntry 형태로 변환하여 필터.
+        # 파인튜닝 베이스 가능 모델만 노출 — gguf/mlx/pytorch/onnx 업로드는 추론 전용.
         custom_entries: list[ModelEntry] = []
         for e in db_entries:
+            src = getattr(e, "source", "hf") or "hf"
+            fmt = getattr(e, "model_format", "safetensors") or "safetensors"
+            if src not in ("hf", "finetuned") and fmt != "safetensors":
+                continue
             custom_entries.append(ModelEntry(
                 hf_repo=e.hf_repo,
                 params_b=e.params_b,

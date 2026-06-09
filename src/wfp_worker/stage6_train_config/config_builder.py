@@ -160,7 +160,12 @@ class TrainConfigBuilder:
         )
         config.save_steps = max(50, steps_per_epoch // 4)
         config.eval_steps = config.save_steps
-        config.logging_steps = max(10, steps_per_epoch // 20)
+        # logging_steps 는 전체 학습 스텝 수를 넘으면 안 됨 — 넘으면 transformers 가
+        # 중간 loss 로그를 한 번도 찍지 않아(최종 train_loss 요약만) 손실 그래프가
+        # 비게 된다(소규모 데이터셋에서 빈번). 짧은 런은 촘촘히(약 5포인트 이상),
+        # 큰 런은 기존 간격 유지.
+        total_steps = steps_per_epoch * config.num_epochs
+        config.logging_steps = max(1, min(10, max(1, total_steps // 5)))
 
         # 사용자 오버라이드 적용
         if override:

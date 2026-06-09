@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from wfp_worker.auth import get_current_user
 from wfp_worker.common.errors import WFPError
 from wfp_worker.common.logger import get_logger
-from wfp_worker.common.types import ArtifactKind, JobSpec, JobState
+from wfp_worker.common.types import CONVERTIBLE_KINDS, ArtifactKind, JobSpec, JobState
 from wfp_worker.db import AdminNotification, User, get_db
 
 log = get_logger(__name__)
@@ -412,6 +412,9 @@ def download_artifact(
         ".gguf": "application/octet-stream",
         ".safetensors": "application/octet-stream",
         ".bin": "application/octet-stream",
+        ".pt": "application/octet-stream",
+        ".npz": "application/octet-stream",
+        ".onnx": "application/octet-stream",
         ".zip": "application/zip",
     }
     media = media_map.get(path.suffix.lower(), "application/octet-stream")
@@ -525,6 +528,168 @@ def upload_to_hf(
         "repo_url": f"https://huggingface.co/{body.repo_id}",
         "private": body.private,
     }
+
+
+# ─────────────────────────────────────────
+# 변환 후 다운로드 (on-demand) — gguf / mlx / pytorch / onnx / merged
+# ─────────────────────────────────────────
+
+# 진행 추적 — "<job_id>:<format>" → {"state": running|done|error, "error": str|None}
+_converting: dict[str, dict] = {}
+
+
+def _conv_key(job_id: str, fmt: str) -> str:
+    return f"{job_id}:{fmt}"
+
+
+class ConvertRequest(BaseModel):
+    """변환 요청. format: merged/gguf/mlx/pytorch/onnx."""
+    format: str
+    quant: str = "Q4_K_M"   # gguf 전용 (f16/f32/q8_0/Q4_K_M/Q5_K_M/Q6_K), mlx: "int4" 시 양자화
+
+
+class ConvertResult(BaseModel):
+    job_id: str
+    format: str
+    # started/in_progress/already_exists/tooling_missing/not_done/done/error
+    status: str
+    detail: str = ""
+
+
+class FormatStatus(BaseModel):
+    format: str
+    available: bool        # 변환 도구 설치 여부
+    state: str             # idle / running / done / error
+    hint: str = ""         # 미설치 시 설치 안내
+    error: str = ""
+
+
+class ConvertStatusResult(BaseModel):
+    job_id: str
+    job_done: bool
+    formats: list[FormatStatus]
+
+
+def _do_convert(job_id: str, kind: ArtifactKind, quant: str) -> None:
+    """백그라운드 변환 worker. 완료 시 spec.artifacts 갱신 + 상태 저장."""
+    from wfp_worker.runtime import save_state
+    from wfp_worker.stage9_package import ConvertFailedError, ToolingMissingError, convert
+    from wfp_worker.stage9_package.packager import _DEFAULT_DEPLOY_ROOT
+
+    key = _conv_key(job_id, kind.value)
+    spec = _jobs.get(job_id)
+    if spec is None:
+        _converting[key] = {"state": "error", "error": "잡 인메모리 없음"}
+        return
+    try:
+        artifact = convert(spec, kind, _DEFAULT_DEPLOY_ROOT, quant=quant)
+        # 기존 동일 kind 교체 (재변환 시)
+        spec.artifacts = [a for a in spec.artifacts if a.kind != kind] + [artifact]
+        save_state(force=True)
+        _converting[key] = {"state": "done", "error": None}
+        log.info("convert_artifact_done",
+                 extra={"job_id": job_id, "extra": {"format": kind.value}})
+    except ToolingMissingError as e:
+        _converting[key] = {"state": "error", "error": e.hint}
+    except (ConvertFailedError, Exception) as e:  # noqa: BLE001
+        log.warning("convert_artifact_failed",
+                    extra={"job_id": job_id, "extra": {"format": kind.value, "err": str(e)[:300]}})
+        _converting[key] = {"state": "error", "error": str(e)[:300]}
+
+
+@router.post("/{job_id}/convert", response_model=ConvertResult)
+async def convert_artifact(
+    job_id: str,
+    body: ConvertRequest,
+    user: User = Depends(get_current_user),
+) -> ConvertResult:
+    """파인튜닝 완료 모델을 다른 포맷으로 변환 (비동기).
+
+    완료 후 GET /jobs/{id}/artifacts/{format} 으로 다운로드.
+    상태는 GET /jobs/{id}/convert/status 폴링.
+    """
+    from wfp_worker.stage9_package import tooling_status
+
+    spec = _get_owned_or_admin(job_id, user)
+    try:
+        kind = ArtifactKind(body.format)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid format: {body.format}") from None
+    if kind not in CONVERTIBLE_KINDS:
+        raise HTTPException(status_code=400, detail=f"변환 불가 format: {body.format}")
+
+    if spec.state != JobState.DONE:
+        return ConvertResult(job_id=job_id, format=body.format, status="not_done",
+                             detail=f"잡 미완료 (현재: {spec.state.value})")
+
+    # 도구 가용성 사전 확인
+    tooling = tooling_status()
+    fmt_tool = tooling.get(body.format, {"available": False, "hint": ""})
+    # merged 외 포맷은 merged(전체 가중치)도 필요
+    needs_merged = kind != ArtifactKind.MERGED and not tooling["merged"]["available"]
+    if not fmt_tool["available"] or needs_merged:
+        hint = fmt_tool.get("hint") or tooling["merged"]["hint"]
+        return ConvertResult(job_id=job_id, format=body.format,
+                             status="tooling_missing", detail=hint)
+
+    # 이미 변환된 아티팩트 존재
+    existing = next((a for a in spec.artifacts if a.kind == kind), None)
+    if existing and Path(existing.uri).exists():
+        return ConvertResult(job_id=job_id, format=body.format, status="already_exists",
+                             detail="이미 변환됨 — 바로 다운로드 가능")
+
+    key = _conv_key(job_id, body.format)
+    if _converting.get(key, {}).get("state") == "running":
+        return ConvertResult(job_id=job_id, format=body.format, status="in_progress",
+                             detail="변환 진행 중")
+
+    import asyncio as _asyncio
+    _converting[key] = {"state": "running", "error": None}
+    _asyncio.create_task(_asyncio.to_thread(_do_convert, job_id, kind, body.quant))
+    log.info("convert_started", extra={"user_id": user.id, "job_id": job_id,
+                                       "extra": {"format": body.format, "quant": body.quant}})
+    return ConvertResult(job_id=job_id, format=body.format, status="started",
+                         detail="변환 시작 — 상태 폴링 후 다운로드")
+
+
+@router.get("/{job_id}/convert/status", response_model=ConvertStatusResult)
+def convert_status(
+    job_id: str,
+    user: User = Depends(get_current_user),
+) -> ConvertStatusResult:
+    """포맷별 변환 가능 여부 + 진행 상태 + 완료(다운로드 가능) 여부."""
+    from wfp_worker.stage9_package import tooling_status
+
+    spec = _get_owned_or_admin(job_id, user)
+    tooling = tooling_status()
+    done_kinds = {a.kind for a in spec.artifacts if Path(a.uri).exists()}
+
+    formats: list[FormatStatus] = []
+    for kind in CONVERTIBLE_KINDS:
+        fmt = kind.value
+        tool = tooling.get(fmt, {"available": False, "hint": ""})
+        prog = _converting.get(_conv_key(job_id, fmt), {})
+        if kind in done_kinds:
+            state = "done"
+        elif prog.get("state") == "running":
+            state = "running"
+        elif prog.get("state") == "error":
+            state = "error"
+        else:
+            state = "idle"
+        formats.append(FormatStatus(
+            format=fmt,
+            available=bool(tool["available"]),
+            state=state,
+            hint=tool.get("hint", ""),
+            error=prog.get("error") or "",
+        ))
+
+    return ConvertStatusResult(
+        job_id=job_id,
+        job_done=(spec.state == JobState.DONE),
+        formats=formats,
+    )
 
 
 # ─────────────────────────────────────────
